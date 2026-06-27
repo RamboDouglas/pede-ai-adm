@@ -623,6 +623,57 @@
         const escapeHtml = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         const safeNum = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
+        // Detecção de pedidos duplicados.
+        // Cenário real: cliente clicou 3x em "finalizar" no celular e mandou o mesmo pedido em 30s.
+        // O bloqueio definitivo precisa ficar no app que CRIA o pedido (debounce do botão);
+        // aqui no painel a gente detecta e protege o dono — destaca visualmente, pede confirmação
+        // ao aceitar, e oferece cancelar as cópias com 1 clique.
+        const DUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutos: janela em que pedidos iguais são suspeitos
+
+        // Assinatura "lógica" de um pedido: mesmo cliente (telefone só dígitos) + mesmo total +
+        // mesma lista de itens (nome + qtd, ordenada). Ignora taxa pra não diferenciar bairro.
+        function orderSignature(o) {
+            if (!o || !o.customer) return '';
+            const phone = String(o.customer.phone || '').replace(/\D/g, '');
+            if (!phone) return ''; // sem telefone, não dá pra agrupar com segurança
+            const items = (o.items || [])
+                .map(i => `${(i.name || '').trim().toLowerCase()}|${safeNum(i.qty)}`)
+                .sort()
+                .join('||');
+            return `${phone}|${safeNum(o.total).toFixed(2)}|${items}`;
+        }
+
+        // Para a lista de pedidos: devolve Map<orderId, { groupSize, groupIds, isOldest }>.
+        // groupIds: IDs do grupo todo. isOldest: true para o mais antigo do grupo (o "original").
+        function findDuplicates(orders) {
+            const groups = new Map(); // sig -> array de orders ordenado por timestamp
+            for (const o of orders) {
+                if (!o || o.status === 'cancelado') continue; // cancelado não conta como duplicata
+                const sig = orderSignature(o);
+                if (!sig) continue;
+                if (!groups.has(sig)) groups.set(sig, []);
+                groups.get(sig).push(o);
+            }
+            const result = new Map();
+            for (const [, arr] of groups) {
+                if (arr.length < 2) continue;
+                arr.sort((a, b) => safeNum(a.timestamp) - safeNum(b.timestamp));
+                // Apenas considera duplicata quando há outro pedido na janela de 5 min do mais antigo.
+                const oldest = arr[0];
+                const inWindow = arr.filter(o => Math.abs(safeNum(o.timestamp) - safeNum(oldest.timestamp)) <= DUP_WINDOW_MS);
+                if (inWindow.length < 2) continue;
+                const ids = inWindow.map(o => o.id);
+                for (const o of inWindow) {
+                    result.set(o.id, {
+                        groupSize: inWindow.length,
+                        groupIds: ids,
+                        isOldest: o.id === oldest.id
+                    });
+                }
+            }
+            return result;
+        }
+
         // Pagamento: backwards-compat com `o.payment` (string única) e suporte a `o.payments` (array
         // de { method, amount }). Sempre devolve string pra exibir.
         function paymentLabel(o) {
@@ -917,10 +968,21 @@
             onSnapshot(q, (snap) => {
                 const todayStr = new Date().toLocaleDateString('pt-BR');
                 window.allOrdersCache = snap.docs.map(d => ({id: d.id, ...d.data()}));
-                
+
                 const activeList = document.getElementById('ordersListActive');
                 const historyList = document.getElementById('ordersListHistory');
-                
+
+                // Calcula duplicatas no conjunto inteiro do dia (antes do filtro de status,
+                // pra agrupar mesmo pedidos NOVO/PREPARO/ENTREGA). Resultado: Map<id, {groupSize, groupIds, isOldest}>.
+                const dupMap = findDuplicates(window.allOrdersCache);
+                window._dupMap = dupMap;
+                // Alerta sonoro/visual ao detectar grupo novo de duplicatas neste ciclo.
+                const newDupGroupSig = JSON.stringify([...new Set([...dupMap.values()].map(v => v.groupIds.join(',')))]);
+                if (dupMap.size > 0 && newDupGroupSig !== window._dupNoticed) {
+                    window._dupNoticed = newDupGroupSig;
+                    showToast(`Atenção: ${dupMap.size} pedido(s) suspeito(s) de duplicata. Cards marcados em amarelo.`, 'info');
+                }
+
                 let htmlActive = ''; let htmlHistory = ''; let pendingCount = 0;
                 window._orderMap = {};
 
@@ -936,6 +998,7 @@
                     if (orderDate !== todayStr) return;
 
                     window._orderMap[d.id] = { ...o, id: d.id };
+                    const dupInfo = dupMap.get(d.id);
                     
                     if (o.status === 'concluido' || o.status === 'cancelado') {
                         const isCanceled = o.status === 'cancelado';
@@ -965,12 +1028,30 @@
                         else if (o.status === 'entrega') { bCls = 'border-blue-500 bg-blue-50'; lbl = 'ENTREGA'; btn = `<button onclick="updateOrderStatus('${d.id}', 'concluido')" class="flex-1 bg-blue-500 text-white py-2 rounded font-bold text-xs uppercase">Marcar Entregue</button>`; }
                         const cancelBtn = `<button onclick="cancelOrder('${d.id}')" class="mt-1 w-full border border-red-300 text-red-500 py-1.5 rounded text-xs font-bold hover:bg-red-50 transition">✕ Cancelar Pedido</button>`;
 
-                        const orderTime = o.timestamp ? new Date(o.timestamp).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : '';
+                        // Badge + ação para pedido suspeito de duplicata.
+                        let dupBadge = '';
+                        let dupActionBtn = '';
+                        if (dupInfo) {
+                            const role = dupInfo.isOldest ? '1º DO GRUPO' : 'PROVÁVEL CÓPIA';
+                            // Card ganha borda âmbar destacada por cima do estilo de status.
+                            bCls = 'border-amber-500 bg-amber-50 shadow-lg';
+                            dupBadge = `
+                                <span class="ml-1 text-[9px] bg-amber-200 text-amber-800 font-black px-1.5 py-0.5 rounded uppercase" title="Detectado pedido com mesmo telefone, total e itens nos últimos 5 min">
+                                    <i class="fas fa-clone text-[8px]"></i> Duplicata ${dupInfo.groupSize}× · ${role}
+                                </span>`;
+                            if (dupInfo.isOldest && dupInfo.groupIds.length > 1) {
+                                dupActionBtn = `<button onclick="cancelDuplicatesOf('${d.id}')" class="mt-1 w-full bg-amber-500 text-white py-1.5 rounded text-xs font-bold hover:bg-amber-600 transition">
+                                    <i class="fas fa-clone"></i> Cancelar as ${dupInfo.groupIds.length - 1} cópia(s) (mantém este)
+                                </button>`;
+                            }
+                        }
+
+                        const orderTime = Number.isFinite(ts) ? new Date(ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : '';
                         htmlActive += `
                         <div class="bg-white p-4 rounded-lg shadow-sm border-l-4 ${bCls}">
                             <div class="flex justify-between items-start mb-2">
                                 <div>
-                                    <h4 class="font-bold text-gray-800">${escapeHtml(o.customer.name)}</h4>
+                                    <h4 class="font-bold text-gray-800">${escapeHtml(o.customer.name)}${dupBadge}</h4>
                                     <div class="flex items-center gap-2 mt-0.5">
                                         <div class="text-[10px] font-black text-gray-400 uppercase">${lbl}</div>
                                         ${orderTime ? `<div class="text-[10px] text-gray-400"><i class="fas fa-clock text-[8px]"></i> ${orderTime}</div>` : ''}
@@ -993,6 +1074,7 @@
                                 </div>
                             </div>
                             <div class="flex gap-2">${btn}</div>
+                            ${dupActionBtn}
                             ${cancelBtn}
                         </div>`;
                     }
@@ -1037,6 +1119,36 @@
                 });
                 logAudit('order.cancel', id, { status: before?.status, total: before?.total }, { status: 'cancelado' }, { reason: reason.trim().slice(0,280) });
             } catch (e) { showToast('Erro ao cancelar: ' + e.message); }
+        };
+
+        // Cancela em lote todas as cópias suspeitas do mesmo grupo, mantendo o pedido `keepId` (o mais antigo).
+        // `opts.skipConfirm` é usado quando outro fluxo já pediu a confirmação ao usuário.
+        window.cancelDuplicatesOf = async (keepId, opts = {}) => {
+            if (!requireRole('cashier', 'cancelar duplicatas')) return;
+            const info = window._dupMap?.get(keepId);
+            if (!info || !info.groupIds || info.groupIds.length < 2) {
+                showToast('Nenhuma cópia detectada para este pedido.');
+                return;
+            }
+            const toCancel = info.groupIds.filter(x => x !== keepId);
+            if (!opts.skipConfirm) {
+                if (!confirm(`Cancelar ${toCancel.length} cópia(s) deste pedido? O original (${keepId.slice(-4).toUpperCase()}) permanece ativo.`)) return;
+            }
+            const reason = `Duplicata automática — original mantido: #${keepId.slice(-4).toUpperCase()}`;
+            const results = await Promise.allSettled(toCancel.map(async (id) => {
+                const before = window._orderMap?.[id];
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id), {
+                    status: 'cancelado',
+                    cancelReason: reason,
+                    canceledBy: currentUser?.uid || 'unknown',
+                    canceledAt: Date.now()
+                });
+                logAudit('order.cancel.duplicate', id, { status: before?.status, total: before?.total }, { status: 'cancelado' }, { reason, originalId: keepId });
+            }));
+            const ok   = results.filter(r => r.status === 'fulfilled').length;
+            const fail = results.length - ok;
+            if (fail === 0) showToast(`${ok} cópia(s) cancelada(s).`, 'success');
+            else showToast(`${ok} cancelada(s), ${fail} falharam. Tente novamente.`);
         };
 
         window.applyReportFilter = async () => {
@@ -1117,10 +1229,17 @@
             document.getElementById('statCanceled').innerText = canceled.length;
             document.getElementById('statCanceledValue').innerText = canceled.length ? fmt(canceledTotal) + ' perdidos' : 'Nenhum no período';
 
-            // Gráfico: pedidos por hora (linha com gradiente) — somente ativos
+            // Gráfico: pedidos por hora — SOMENTE ativos (cancelados ficam fora).
+            // Filtro redundante e timestamp válido garantem que nenhum cancelado nem pedido
+            // com timestamp quebrado caia em "00h".
             const hrs = Array.from({length: 24}, (_, i) => `${String(i).padStart(2,'0')}h`);
             const dataHrs = Array(24).fill(0);
-            active.forEach(o => dataHrs[new Date(o.timestamp).getHours()]++);
+            active
+                .filter(o => o && o.status !== 'cancelado' && Number.isFinite(safeNum(o.timestamp)) && safeNum(o.timestamp) > 0)
+                .forEach(o => {
+                    const h = new Date(safeNum(o.timestamp)).getHours();
+                    if (h >= 0 && h <= 23) dataHrs[h]++;
+                });
             renderChartLine('chartTime', hrs, dataHrs);
 
             // Gráfico: top produtos (barras horizontais) — somente ativos
@@ -1953,11 +2072,22 @@
         }
         setInterval(updateBusinessHoursBanner, 60 * 1000);
 
-        // Wrap updateOrderStatus: se for transição NOVO→PREPARO fora do horário, pede confirmação extra.
+        // Wrap updateOrderStatus: aceitar (NOVO→PREPARO) pede confirmação extra em dois cenários —
+        // fora do horário OU pedido suspeito de duplicata.
         const _origUpdateOrderStatus = window.updateOrderStatus;
         window.updateOrderStatus = async (id, status) => {
-            if (status === 'preparo' && !isWithinBusinessHours()) {
-                if (!confirm('A loja está FORA do horário de funcionamento. Aceitar mesmo assim?')) return;
+            if (status === 'preparo') {
+                const dup = window._dupMap?.get(id);
+                if (dup && !dup.isOldest) {
+                    if (!confirm(`Este pedido é PROVÁVEL CÓPIA (${dup.groupSize} pedidos iguais em 5 min). Aceitar mesmo assim?`)) return;
+                } else if (dup && dup.isOldest && dup.groupIds.length > 1) {
+                    if (!confirm(`Existem ${dup.groupIds.length - 1} cópia(s) deste pedido. Quer aceitar SÓ este e cancelar as cópias?`)) return;
+                    // Cancela as cópias em background; mantém este pra aceitação.
+                    window.cancelDuplicatesOf(id, { skipConfirm: true });
+                }
+                if (!isWithinBusinessHours()) {
+                    if (!confirm('A loja está FORA do horário de funcionamento. Aceitar mesmo assim?')) return;
+                }
             }
             return _origUpdateOrderStatus(id, status);
         };
