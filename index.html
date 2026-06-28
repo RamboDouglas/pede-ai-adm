@@ -84,7 +84,7 @@
     <!-- Toasts -->
     <div id="toastContainer" class="fixed bottom-4 right-4 z-[9999] flex flex-col gap-2 items-end pointer-events-none"></div>
 
-    <audio id="notificationSound" loop>
+    <audio id="notificationSound" loop preload="auto" crossorigin="anonymous">
         <source src="https://cdn.freesound.org/previews/316/316847_4939433-lq.mp3" type="audio/mpeg">
     </audio>
 
@@ -718,70 +718,114 @@
 
         let soundEnabled = true;
 
-        // Buzina alta sintética via Web Audio API
-        let hornTimer = null;
-        let audioCtx = null;
+        // ====================================================================
+        //  Sistema de alerta de pedido novo
+        // --------------------------------------------------------------------
+        //  3 camadas em paralelo, redundância para o caso de uma falhar:
+        //    1) <audio id="notificationSound" loop>  — som principal, HTML5
+        //    2) Web Notifications API                — alerta cross-tab/SO
+        //    3) Flash do <title>                     — chama atenção em qualquer aba
+        //
+        //  Por que NÃO Web Audio API: a versão anterior (sintetizada com
+        //  oscilladores) dependia do AudioContext estar "resumed", o que
+        //  exige gesto do usuário recente. Se o dono ficou na aba sem clicar
+        //  por horas, AudioContext suspendia silenciosamente e o try/catch
+        //  engolia o erro. Pedido entrava, dono não ouvia.
+        // ====================================================================
 
-        function getAudioCtx() {
-            if (!audioCtx || audioCtx.state === 'closed') {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const audioEl = document.getElementById('notificationSound');
+        const ORIGINAL_TITLE = document.title;
+        let _alertActive = false;
+        let _titleFlashTimer = null;
+        let _alertNotification = null;
+
+        // Prime: chamado no LOGIN (gesto do usuário, satisfaz autoplay policy).
+        // Dá um play+pause muted no audio pra desbloquear, e pede permissão de notificação.
+        function primeAlertSystem() {
+            if (audioEl) {
+                try {
+                    audioEl.muted = true;
+                    audioEl.volume = 1.0;
+                    const p = audioEl.play();
+                    const reset = () => { try { audioEl.pause(); audioEl.currentTime = 0; audioEl.muted = false; } catch(_) {} };
+                    if (p && typeof p.then === 'function') {
+                        p.then(reset).catch(() => { audioEl.muted = false; });
+                    } else { reset(); }
+                } catch (e) {}
             }
-            if (audioCtx.state === 'suspended') audioCtx.resume();
-            return audioCtx;
+            if ('Notification' in window && Notification.permission === 'default') {
+                // Em alguns browsers, requestPermission() retorna Promise; em outros, usa callback. Cobre os dois.
+                try {
+                    const req = Notification.requestPermission((p) => p);
+                    if (req && typeof req.catch === 'function') req.catch(() => {});
+                } catch (_) {}
+            }
         }
 
-        function playHornBlast() {
+        function flashTitle() {
+            if (_titleFlashTimer) return;
+            let on = false;
+            _titleFlashTimer = setInterval(() => {
+                on = !on;
+                document.title = on ? '🔔 NOVO PEDIDO!' : ORIGINAL_TITLE;
+            }, 800);
+        }
+
+        function stopTitleFlash() {
+            if (_titleFlashTimer) {
+                clearInterval(_titleFlashTimer);
+                _titleFlashTimer = null;
+            }
+            document.title = ORIGINAL_TITLE;
+        }
+
+        function showOrderNotification(count) {
+            if (!('Notification' in window) || Notification.permission !== 'granted') return;
+            // Só mostra UMA notificação ativa por vez — a tag substitui a anterior.
             try {
-                const ctx = getAudioCtx();
-                const t = ctx.currentTime;
-
-                // Oscilador principal — dente-de-serra (timbre de buzina)
-                const osc1 = ctx.createOscillator();
-                osc1.type = 'sawtooth';
-                osc1.frequency.setValueAtTime(220, t);
-                osc1.frequency.linearRampToValueAtTime(260, t + 0.15);
-                osc1.frequency.linearRampToValueAtTime(220, t + 0.5);
-
-                // Segunda harmônica para corpo
-                const osc2 = ctx.createOscillator();
-                osc2.type = 'square';
-                osc2.frequency.setValueAtTime(440, t);
-                osc2.frequency.linearRampToValueAtTime(520, t + 0.15);
-                osc2.frequency.linearRampToValueAtTime(440, t + 0.5);
-
-                // Distorção para mais agressividade
-                const wave = ctx.createWaveShaper();
-                const curve = new Float32Array(256);
-                for (let i = 0; i < 256; i++) { const x = (i * 2) / 256 - 1; curve[i] = (Math.PI + 400) * x / (Math.PI + 400 * Math.abs(x)); }
-                wave.curve = curve;
-
-                const gain = ctx.createGain();
-                gain.gain.setValueAtTime(0, t);
-                gain.gain.linearRampToValueAtTime(1.0, t + 0.03);   // attack rápido
-                gain.gain.setValueAtTime(1.0, t + 0.4);
-                gain.gain.linearRampToValueAtTime(0, t + 0.55);     // release suave
-
-                osc1.connect(wave); osc2.connect(wave);
-                wave.connect(gain); gain.connect(ctx.destination);
-
-                osc1.start(t); osc1.stop(t + 0.6);
-                osc2.start(t); osc2.stop(t + 0.6);
-            } catch (e) {}
+                if (_alertNotification) { try { _alertNotification.close(); } catch(_) {} }
+                _alertNotification = new Notification('🔔 Pedido novo no painel!', {
+                    body: `${count} pedido(s) aguardando atendimento.`,
+                    tag: 'pede-ai-novo-pedido',
+                    requireInteraction: true   // fica até o dono interagir
+                });
+                _alertNotification.onclick = () => {
+                    try { window.focus(); _alertNotification.close(); } catch(_) {}
+                };
+            } catch (e) { /* notificações bloqueadas */ }
         }
 
-        function startHorn() {
-            if (hornTimer) return;
-            playHornBlast();
-            hornTimer = setInterval(playHornBlast, 1800);
-        }
-        function stopHorn() { if (hornTimer) { clearInterval(hornTimer); hornTimer = null; } }
-
-        function playAlert() {
+        function playAlert(pendingCount) {
             if (!soundEnabled) return;
-            startHorn();
+            if (_alertActive) return;        // já está tocando, não reseta
+            _alertActive = true;
+            // Som em loop via HTML5 audio
+            if (audioEl) {
+                try {
+                    audioEl.currentTime = 0;
+                    audioEl.volume = 1.0;
+                    audioEl.muted = false;
+                    const p = audioEl.play();
+                    if (p && typeof p.catch === 'function') {
+                        p.catch(err => {
+                            // Política de autoplay bloqueou; toast informa o dono que basta interagir.
+                            console.warn('Audio bloqueado:', err.message);
+                            showToast('Som bloqueado pelo navegador. Clique em qualquer lugar do painel pra liberar.', 'info');
+                        });
+                    }
+                } catch (e) {}
+            }
+            flashTitle();
+            showOrderNotification(pendingCount || 1);
         }
+
         function stopAlert() {
-            stopHorn();
+            _alertActive = false;
+            if (audioEl) {
+                try { audioEl.pause(); audioEl.currentTime = 0; } catch (e) {}
+            }
+            stopTitleFlash();
+            if (_alertNotification) { try { _alertNotification.close(); } catch(_) {} _alertNotification = null; }
         }
 
         document.getElementById('currentDateDisplay').innerText = new Date().toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'long' });
@@ -854,6 +898,7 @@
                 const emailEl = document.getElementById('adminUserEmail');
                 if (emailEl) emailEl.innerText = (user.email || user.uid.slice(0,8)) + ` · ${currentRole}`;
                 if (!dashboardStarted) { initDashboard(); dashboardStarted = true; }
+                primeAlertSystem(); // Desbloqueia áudio + pede permissão de notificação após login (gesto válido)
                 updateOnlineStatus();
                 connectQZSilent(); // tenta QZ Tray em background
                 startIdleTimer();
@@ -1084,7 +1129,7 @@
                 historyList.innerHTML = htmlHistory;
                 document.getElementById('pendingCount').innerText = pendingCount;
                 document.getElementById('pendingCount').classList.toggle('hidden', pendingCount === 0);
-                if(pendingCount > 0 && soundEnabled) { playAlert(); } else { stopAlert(); }
+                if(pendingCount > 0 && soundEnabled) { playAlert(pendingCount); } else { stopAlert(); }
                 scheduleReportRefresh();
             }, (err) => updateOnlineStatus(err));
 
@@ -2033,7 +2078,12 @@
                 showToast("Erro ao remover: " + e.message);
             }
         };
-        window.toggleSound = () => { soundEnabled = !soundEnabled; const btn = document.getElementById('soundBtn'); btn.innerHTML = soundEnabled ? '<i class="fas fa-volume-up"></i> Som Ativado' : '<i class="fas fa-volume-mute"></i> Som Mudo'; if (!soundEnabled) stopHorn(); };
+        window.toggleSound = () => {
+            soundEnabled = !soundEnabled;
+            const btn = document.getElementById('soundBtn');
+            btn.innerHTML = soundEnabled ? '<i class="fas fa-volume-up"></i> Som Ativado' : '<i class="fas fa-volume-mute"></i> Som Mudo';
+            if (!soundEnabled) stopAlert();
+        };
         window.showTab = (id) => { ['orders', 'reports', 'products', 'categories', 'settings'].forEach(t => { document.getElementById(`tab-${t}`).classList.add('hidden'); document.getElementById(`nav-${t}`).classList.remove('bg-gray-800', 'text-brava-yellow', 'font-bold'); }); document.getElementById(`tab-${id}`).classList.remove('hidden'); document.getElementById(`nav-${id}`).classList.add('bg-gray-800', 'text-brava-yellow', 'font-bold'); if(id === 'reports') applyReportFilter(); };
         window.toggleReportInputs = () => { const type = document.getElementById('reportFilterType').value; document.getElementById('reportFilterDate').classList.toggle('hidden', type !== 'custom_date'); };
 
