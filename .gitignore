@@ -1,0 +1,6 @@
+# Credenciais do Firebase Admin SDK — NUNCA commitar.
+scripts/serviceAccountKey.json
+*.serviceAccountKey.json
+.firebase/
+.runtimeconfig.json
+node_modules/

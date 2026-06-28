@@ -98,6 +98,7 @@
             <input type="email" id="adminEmail" autocomplete="username" class="w-full border-2 border-gray-200 rounded-lg p-3 mb-3 text-center text-lg outline-none focus:border-brava-yellow" placeholder="E-mail">
             <input type="password" id="adminPass" autocomplete="current-password" class="w-full border-2 border-gray-200 rounded-lg p-3 mb-4 text-center text-lg outline-none focus:border-brava-yellow" placeholder="Senha" onkeydown="if(event.key==='Enter') attemptLogin()">
             <button onclick="attemptLogin()" id="btnLogin" class="w-full bg-brava-black text-brava-yellow font-bold py-3 rounded-lg hover:opacity-90">ENTRAR</button>
+            <button type="button" onclick="forgotPassword()" class="w-full text-xs text-gray-500 hover:text-gray-700 mt-3 underline">Esqueci minha senha</button>
             <p id="loginError" class="text-red-500 text-sm mt-3 hidden"></p>
         </div>
     </div>
@@ -117,16 +118,16 @@
                 <button onclick="showTab('orders')" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3 bg-gray-800 text-brava-yellow font-bold" id="nav-orders">
                     <i class="fas fa-bell"></i> Pedidos <span id="pendingCount" class="bg-red-500 text-white text-xs px-2 py-0.5 rounded-full ml-auto hidden animate-bounce">0</span>
                 </button>
-                <button onclick="showTab('reports')" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3" id="nav-reports">
+                <button onclick="showTab('reports')" data-min-role="manager" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3" id="nav-reports">
                     <i class="fas fa-chart-pie"></i> Relatórios
                 </button>
-                <button onclick="showTab('products')" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3" id="nav-products">
+                <button onclick="showTab('products')" data-min-role="manager" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3" id="nav-products">
                     <i class="fas fa-box"></i> Produtos
                 </button>
-                <button onclick="showTab('categories')" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3" id="nav-categories">
+                <button onclick="showTab('categories')" data-min-role="manager" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3" id="nav-categories">
                     <i class="fas fa-tags"></i> Categorias
                 </button>
-                <button onclick="showTab('settings')" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3" id="nav-settings">
+                <button onclick="showTab('settings')" data-min-role="manager" class="w-full text-left p-3 rounded hover:bg-gray-800 flex items-center gap-3" id="nav-settings">
                     <i class="fas fa-cog"></i> Configurações
                 </button>
             </nav>
@@ -145,6 +146,11 @@
             
             <!-- TAB: PEDIDOS -->
             <div id="tab-orders" class="space-y-6 pb-20">
+                <!-- Banner "fora do horário" — escondido por padrão; populado por updateBusinessHoursBanner() -->
+                <div id="offHoursBanner" class="hidden bg-amber-100 border border-amber-300 text-amber-900 rounded-lg p-3 text-sm font-bold flex items-center gap-2">
+                    <i class="fas fa-moon"></i>
+                    <span id="offHoursBannerText">Loja fora do horário de funcionamento.</span>
+                </div>
                 <div class="flex justify-between items-center border-b pb-4">
                     <div>
                         <h2 class="text-2xl font-bold text-gray-800">Pedidos de Hoje</h2>
@@ -587,17 +593,107 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getFirestore, collection, onSnapshot, addDoc, doc, updateDoc, deleteDoc, getDoc, getDocs, setDoc, query, where, orderBy, limit, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-        import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, sendPasswordResetEmail, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 
         const firebaseConfig = { apiKey: "AIzaSyDcLJgd7hRug4DOdZG5pBVADvb8gv50X04", authDomain: "pede-ai-ff294.firebaseapp.com", projectId: "pede-ai-ff294", storageBucket: "pede-ai-ff294.firebasestorage.app", messagingSenderId: "785420254615", appId: "1:785420254615:web:14723281bba318ac9a98d2" };
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
         const auth = getAuth(app);
-        const appId = 'loja-padrao';
+
+        // appId vira *let* — definitivo depois que o Custom Claim `tenantId` for lido no login.
+        // 'loja-padrao' fica como fallback compatível com o deploy atual (uma loja só),
+        // até todos os usuários terem o claim setado via scripts/setup-claims.js.
+        let appId = 'loja-padrao';
+        let currentUser = null;
+        let currentRole = 'owner';  // sem claim: assume owner (modo single-tenant legado)
+
+        // Helpers de autorização ----------------------------------------------------
+        // Hierarquia: owner > manager > cashier.
+        const ROLE_RANK = { cashier: 1, manager: 2, owner: 3 };
+        function hasRole(min) {
+            return (ROLE_RANK[currentRole] || 0) >= (ROLE_RANK[min] || 99);
+        }
+        function requireRole(min, action = 'esta ação') {
+            if (hasRole(min)) return true;
+            showToast(`Sem permissão para ${action}. Fale com o dono.`);
+            return false;
+        }
 
         // Helpers de segurança/robustez
         const escapeHtml = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         const safeNum = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+        // Detecção de pedidos duplicados.
+        // Cenário real: cliente clicou 3x em "finalizar" no celular e mandou o mesmo pedido em 30s.
+        // O bloqueio definitivo precisa ficar no app que CRIA o pedido (debounce do botão);
+        // aqui no painel a gente detecta e protege o dono — destaca visualmente, pede confirmação
+        // ao aceitar, e oferece cancelar as cópias com 1 clique.
+        const DUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutos: janela em que pedidos iguais são suspeitos
+
+        // Assinatura "lógica" de um pedido: mesmo cliente (telefone só dígitos) + mesmo total +
+        // mesma lista de itens (nome + qtd, ordenada). Ignora taxa pra não diferenciar bairro.
+        function orderSignature(o) {
+            if (!o || !o.customer) return '';
+            const phone = String(o.customer.phone || '').replace(/\D/g, '');
+            if (!phone) return ''; // sem telefone, não dá pra agrupar com segurança
+            const items = (o.items || [])
+                .map(i => `${(i.name || '').trim().toLowerCase()}|${safeNum(i.qty)}`)
+                .sort()
+                .join('||');
+            return `${phone}|${safeNum(o.total).toFixed(2)}|${items}`;
+        }
+
+        // Para a lista de pedidos: devolve Map<orderId, { groupSize, groupIds, isOldest }>.
+        // groupIds: IDs do grupo todo. isOldest: true para o mais antigo do grupo (o "original").
+        function findDuplicates(orders) {
+            const groups = new Map(); // sig -> array de orders ordenado por timestamp
+            for (const o of orders) {
+                if (!o || o.status === 'cancelado') continue; // cancelado não conta como duplicata
+                const sig = orderSignature(o);
+                if (!sig) continue;
+                if (!groups.has(sig)) groups.set(sig, []);
+                groups.get(sig).push(o);
+            }
+            const result = new Map();
+            for (const [, arr] of groups) {
+                if (arr.length < 2) continue;
+                arr.sort((a, b) => safeNum(a.timestamp) - safeNum(b.timestamp));
+                // Apenas considera duplicata quando há outro pedido na janela de 5 min do mais antigo.
+                const oldest = arr[0];
+                const inWindow = arr.filter(o => Math.abs(safeNum(o.timestamp) - safeNum(oldest.timestamp)) <= DUP_WINDOW_MS);
+                if (inWindow.length < 2) continue;
+                const ids = inWindow.map(o => o.id);
+                for (const o of inWindow) {
+                    result.set(o.id, {
+                        groupSize: inWindow.length,
+                        groupIds: ids,
+                        isOldest: o.id === oldest.id
+                    });
+                }
+            }
+            return result;
+        }
+
+        // Pagamento: backwards-compat com `o.payment` (string única) e suporte a `o.payments` (array
+        // de { method, amount }). Sempre devolve string pra exibir.
+        function paymentLabel(o) {
+            if (o && Array.isArray(o.payments) && o.payments.length) {
+                return o.payments
+                    .map(p => `${(p.method || '-').toUpperCase()} R$ ${safeNum(p.amount).toFixed(2)}`)
+                    .join(' + ');
+            }
+            return (o && o.payment) ? String(o.payment) : '';
+        }
+
+        // Troco: prefere cálculo a partir de o.cashReceived (número); cai pro texto o.change (legado).
+        function changeLabel(o) {
+            const received = safeNum(o?.cashReceived);
+            const total    = safeNum(o?.total);
+            if (received > 0 && received >= total) {
+                return `R$ ${(received - total).toFixed(2)} (recebido R$ ${received.toFixed(2)})`;
+            }
+            return o && o.change ? String(o.change) : '';
+        }
 
         // Toasts: substituem alert() para erros/sucessos sem bloquear a UI
         window.showToast = (msg, type = 'error') => {
@@ -736,22 +832,119 @@
                 .finally(() => { btn.disabled = false; btn.innerText = "ENTRAR"; });
         };
 
+        // Persistência LOCAL para que F5 mantenha sessão; idle timer abaixo controla expiração.
+        setPersistence(auth, browserLocalPersistence).catch(e => console.warn('setPersistence:', e));
+
         // Mantém a sessão e controla o acesso ao painel via estado de autenticação
         let dashboardStarted = false;
-        onAuthStateChanged(auth, (user) => {
+        onAuthStateChanged(auth, async (user) => {
+            currentUser = user;
             if (user) {
+                // Lê Custom Claims (tenantId + role). Sem claim, mantém o legado: appId='loja-padrao' / role='owner'.
+                try {
+                    const tok = await user.getIdTokenResult();
+                    if (tok.claims.tenantId) appId = String(tok.claims.tenantId);
+                    if (tok.claims.role)     currentRole = String(tok.claims.role);
+                } catch (e) {
+                    console.warn('getIdTokenResult falhou — usando defaults:', e.message);
+                }
+                applyRoleVisibility();
                 document.getElementById('loginScreen').classList.add('hidden');
                 document.getElementById('dashboard').classList.remove('hidden');
+                const emailEl = document.getElementById('adminUserEmail');
+                if (emailEl) emailEl.innerText = (user.email || user.uid.slice(0,8)) + ` · ${currentRole}`;
                 if (!dashboardStarted) { initDashboard(); dashboardStarted = true; }
                 updateOnlineStatus();
                 connectQZSilent(); // tenta QZ Tray em background
+                startIdleTimer();
             } else {
+                stopIdleTimer();
                 document.getElementById('dashboard').classList.add('hidden');
                 document.getElementById('loginScreen').classList.remove('hidden');
             }
         });
 
+        // Esconde elementos marcados com data-min-role quando o usuário não tem permissão.
+        function applyRoleVisibility() {
+            document.querySelectorAll('[data-min-role]').forEach(el => {
+                const min = el.getAttribute('data-min-role');
+                el.classList.toggle('hidden', !hasRole(min));
+            });
+        }
+
         window.logout = () => signOut(auth);
+
+        // Logout por inatividade — em terminal de loja compartilhado, sessão eterna é risco.
+        const IDLE_LIMIT_MS = 30 * 60 * 1000;  // 30 minutos
+        let _idleTimer = null;
+        function startIdleTimer() {
+            stopIdleTimer();
+            const reset = () => {
+                clearTimeout(_idleTimer);
+                _idleTimer = setTimeout(() => {
+                    showToast('Sessão encerrada por inatividade.', 'info');
+                    signOut(auth);
+                }, IDLE_LIMIT_MS);
+            };
+            ['click','keydown','mousemove','touchstart'].forEach(ev =>
+                document.addEventListener(ev, reset, { passive: true })
+            );
+            window._idleResetFn = reset;
+            reset();
+        }
+        function stopIdleTimer() {
+            clearTimeout(_idleTimer);
+            _idleTimer = null;
+            if (window._idleResetFn) {
+                ['click','keydown','mousemove','touchstart'].forEach(ev =>
+                    document.removeEventListener(ev, window._idleResetFn, { passive: true })
+                );
+                window._idleResetFn = null;
+            }
+        }
+
+        // Recuperação de senha — antes, dono esquecido só com Console Firebase aberto.
+        window.forgotPassword = async () => {
+            const email = (document.getElementById('adminEmail').value || '').trim();
+            const errEl = document.getElementById('loginError');
+            errEl.classList.add('hidden');
+            if (!email) {
+                errEl.innerText = 'Digite o e-mail antes para receber o link.';
+                errEl.classList.remove('hidden');
+                return;
+            }
+            try {
+                await sendPasswordResetEmail(auth, email);
+                showToast('Link de redefinição enviado pro e-mail.', 'success');
+            } catch (e) {
+                const code = (e && e.code) || '';
+                const msg = code === 'auth/invalid-email' ? 'E-mail inválido.'
+                          : code === 'auth/user-not-found' ? 'E-mail não cadastrado.'
+                          : 'Falha ao enviar link. Tente novamente.';
+                errEl.innerText = msg;
+                errEl.classList.remove('hidden');
+            }
+        };
+
+        // Audit log — append-only em artifacts/{tenant}/private/audit/log
+        async function logAudit(action, target, before, after, meta = {}) {
+            try {
+                await addDoc(collection(db, 'artifacts', appId, 'private', 'audit', 'log'), {
+                    ts: Date.now(),
+                    uid: currentUser?.uid || null,
+                    email: currentUser?.email || null,
+                    role: currentRole,
+                    action,
+                    target: String(target ?? ''),
+                    before: before ?? null,
+                    after: after ?? null,
+                    meta
+                });
+            } catch (e) {
+                // Não bloqueia a operação principal, mas avisa no console.
+                console.warn('Falha ao gravar audit:', e.message);
+            }
+        }
 
         // Debounce do refresh do relatório: snapshot dispara muito em hora de pico —
         // sem isso, cada update vira um getDocs(2000) + 3 redraws de Chart.js.
@@ -775,10 +968,21 @@
             onSnapshot(q, (snap) => {
                 const todayStr = new Date().toLocaleDateString('pt-BR');
                 window.allOrdersCache = snap.docs.map(d => ({id: d.id, ...d.data()}));
-                
+
                 const activeList = document.getElementById('ordersListActive');
                 const historyList = document.getElementById('ordersListHistory');
-                
+
+                // Calcula duplicatas no conjunto inteiro do dia (antes do filtro de status,
+                // pra agrupar mesmo pedidos NOVO/PREPARO/ENTREGA). Resultado: Map<id, {groupSize, groupIds, isOldest}>.
+                const dupMap = findDuplicates(window.allOrdersCache);
+                window._dupMap = dupMap;
+                // Alerta sonoro/visual ao detectar grupo novo de duplicatas neste ciclo.
+                const newDupGroupSig = JSON.stringify([...new Set([...dupMap.values()].map(v => v.groupIds.join(',')))]);
+                if (dupMap.size > 0 && newDupGroupSig !== window._dupNoticed) {
+                    window._dupNoticed = newDupGroupSig;
+                    showToast(`Atenção: ${dupMap.size} pedido(s) suspeito(s) de duplicata. Cards marcados em amarelo.`, 'info');
+                }
+
                 let htmlActive = ''; let htmlHistory = ''; let pendingCount = 0;
                 window._orderMap = {};
 
@@ -786,10 +990,15 @@
                     const o = d.data();
                     // Defesa contra docs malformados — um pedido inválido não pode quebrar o render dos outros.
                     if (!o || !o.customer || !Array.isArray(o.items)) return;
-                    const orderDate = new Date(o.timestamp).toLocaleDateString('pt-BR');
+                    // B05: pedido sem timestamp não pode sumir silenciosamente.
+                    const ts = Number(o.timestamp);
+                    const orderDate = Number.isFinite(ts)
+                        ? new Date(ts).toLocaleDateString('pt-BR')
+                        : todayStr; // se vier sem ts, trata como hoje
                     if (orderDate !== todayStr) return;
 
                     window._orderMap[d.id] = { ...o, id: d.id };
+                    const dupInfo = dupMap.get(d.id);
                     
                     if (o.status === 'concluido' || o.status === 'cancelado') {
                         const isCanceled = o.status === 'cancelado';
@@ -812,17 +1021,37 @@
                         let lbl = 'NOVO';
                         let btn = `<button onclick="updateOrderStatus('${d.id}', 'preparo')" class="flex-1 bg-red-500 text-white py-2 rounded font-bold text-xs">ACEITAR</button>`;
 
-                        if (o.status === 'novo') pendingCount++;
+                        // B01: status desconhecido/ausente caía no visual "NOVO" mas NÃO entrava no pendingCount —
+                        // buzina não tocava. Agora qualquer status fora do conjunto conhecido conta como pendente.
+                        if (o.status === 'novo' || !['novo','preparo','entrega','concluido','cancelado'].includes(o.status)) pendingCount++;
                         else if (o.status === 'preparo') { bCls = 'border-yellow-500 bg-yellow-50'; lbl = 'PREPARO'; btn = `<button onclick="updateOrderStatus('${d.id}', 'entrega')" class="flex-1 bg-yellow-500 text-white py-2 rounded font-bold text-xs uppercase">Saiu p/ Entrega</button>`; }
                         else if (o.status === 'entrega') { bCls = 'border-blue-500 bg-blue-50'; lbl = 'ENTREGA'; btn = `<button onclick="updateOrderStatus('${d.id}', 'concluido')" class="flex-1 bg-blue-500 text-white py-2 rounded font-bold text-xs uppercase">Marcar Entregue</button>`; }
                         const cancelBtn = `<button onclick="cancelOrder('${d.id}')" class="mt-1 w-full border border-red-300 text-red-500 py-1.5 rounded text-xs font-bold hover:bg-red-50 transition">✕ Cancelar Pedido</button>`;
 
-                        const orderTime = o.timestamp ? new Date(o.timestamp).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : '';
+                        // Badge + ação para pedido suspeito de duplicata.
+                        let dupBadge = '';
+                        let dupActionBtn = '';
+                        if (dupInfo) {
+                            const role = dupInfo.isOldest ? '1º DO GRUPO' : 'PROVÁVEL CÓPIA';
+                            // Card ganha borda âmbar destacada por cima do estilo de status.
+                            bCls = 'border-amber-500 bg-amber-50 shadow-lg';
+                            dupBadge = `
+                                <span class="ml-1 text-[9px] bg-amber-200 text-amber-800 font-black px-1.5 py-0.5 rounded uppercase" title="Detectado pedido com mesmo telefone, total e itens nos últimos 5 min">
+                                    <i class="fas fa-clone text-[8px]"></i> Duplicata ${dupInfo.groupSize}× · ${role}
+                                </span>`;
+                            if (dupInfo.isOldest && dupInfo.groupIds.length > 1) {
+                                dupActionBtn = `<button onclick="cancelDuplicatesOf('${d.id}')" class="mt-1 w-full bg-amber-500 text-white py-1.5 rounded text-xs font-bold hover:bg-amber-600 transition">
+                                    <i class="fas fa-clone"></i> Cancelar as ${dupInfo.groupIds.length - 1} cópia(s) (mantém este)
+                                </button>`;
+                            }
+                        }
+
+                        const orderTime = Number.isFinite(ts) ? new Date(ts).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : '';
                         htmlActive += `
                         <div class="bg-white p-4 rounded-lg shadow-sm border-l-4 ${bCls}">
                             <div class="flex justify-between items-start mb-2">
                                 <div>
-                                    <h4 class="font-bold text-gray-800">${escapeHtml(o.customer.name)}</h4>
+                                    <h4 class="font-bold text-gray-800">${escapeHtml(o.customer.name)}${dupBadge}</h4>
                                     <div class="flex items-center gap-2 mt-0.5">
                                         <div class="text-[10px] font-black text-gray-400 uppercase">${lbl}</div>
                                         ${orderTime ? `<div class="text-[10px] text-gray-400"><i class="fas fa-clock text-[8px]"></i> ${orderTime}</div>` : ''}
@@ -840,11 +1069,12 @@
                             <div class="bg-white border p-2 rounded text-sm mb-3">
                                 ${o.items.map(i => `<div class="flex justify-between py-0.5 border-b border-dashed border-gray-100 last:border-0"><span>${safeNum(i.qty)}x ${escapeHtml(i.name)}</span><span>R$ ${safeNum(i.price).toFixed(2)}</span></div>`).join('')}
                                 <div class="mt-1 pt-1 border-t flex justify-between items-center">
-                                    <span class="text-[10px] font-black uppercase text-gray-400">${escapeHtml(o.payment || '')}</span>
+                                    <span class="text-[10px] font-black uppercase text-gray-400">${escapeHtml(paymentLabel(o))}</span>
                                     <span class="font-bold text-gray-800">R$ ${safeNum(o.total).toFixed(2)}</span>
                                 </div>
                             </div>
                             <div class="flex gap-2">${btn}</div>
+                            ${dupActionBtn}
                             ${cancelBtn}
                         </div>`;
                     }
@@ -864,11 +1094,61 @@
             getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config')).then(s => { if(s.exists()){ window.settings = s.data(); renderSettings(); updateBranding(); } });
         }
 
-        window.updateOrderStatus = async (id, status) => { try { await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id), { status }); } catch (e) { showToast("Erro ao atualizar pedido: " + e.message); } };
+        window.updateOrderStatus = async (id, status) => {
+            if (!requireRole('cashier', 'atualizar pedido')) return;
+            const before = window._orderMap?.[id];
+            try {
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id), { status });
+                logAudit('order.status', id, { status: before?.status }, { status });
+            } catch (e) { showToast("Erro ao atualizar pedido: " + e.message); }
+        };
         window.cancelOrder = async (id) => {
-            if (!confirm('Cancelar este pedido? O cliente verá o status "Cancelado".')) return;
-            try { await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id), { status: 'cancelado' }); }
-            catch (e) { showToast('Erro ao cancelar: ' + e.message); }
+            if (!requireRole('cashier', 'cancelar pedido')) return;
+            const reason = prompt('Motivo do cancelamento (obrigatório):');
+            if (!reason || !reason.trim()) {
+                showToast('Cancelamento requer motivo.');
+                return;
+            }
+            const before = window._orderMap?.[id];
+            try {
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id), {
+                    status: 'cancelado',
+                    cancelReason: reason.trim().slice(0, 280),
+                    canceledBy: currentUser?.uid || 'unknown',
+                    canceledAt: Date.now()
+                });
+                logAudit('order.cancel', id, { status: before?.status, total: before?.total }, { status: 'cancelado' }, { reason: reason.trim().slice(0,280) });
+            } catch (e) { showToast('Erro ao cancelar: ' + e.message); }
+        };
+
+        // Cancela em lote todas as cópias suspeitas do mesmo grupo, mantendo o pedido `keepId` (o mais antigo).
+        // `opts.skipConfirm` é usado quando outro fluxo já pediu a confirmação ao usuário.
+        window.cancelDuplicatesOf = async (keepId, opts = {}) => {
+            if (!requireRole('cashier', 'cancelar duplicatas')) return;
+            const info = window._dupMap?.get(keepId);
+            if (!info || !info.groupIds || info.groupIds.length < 2) {
+                showToast('Nenhuma cópia detectada para este pedido.');
+                return;
+            }
+            const toCancel = info.groupIds.filter(x => x !== keepId);
+            if (!opts.skipConfirm) {
+                if (!confirm(`Cancelar ${toCancel.length} cópia(s) deste pedido? O original (${keepId.slice(-4).toUpperCase()}) permanece ativo.`)) return;
+            }
+            const reason = `Duplicata automática — original mantido: #${keepId.slice(-4).toUpperCase()}`;
+            const results = await Promise.allSettled(toCancel.map(async (id) => {
+                const before = window._orderMap?.[id];
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id), {
+                    status: 'cancelado',
+                    cancelReason: reason,
+                    canceledBy: currentUser?.uid || 'unknown',
+                    canceledAt: Date.now()
+                });
+                logAudit('order.cancel.duplicate', id, { status: before?.status, total: before?.total }, { status: 'cancelado' }, { reason, originalId: keepId });
+            }));
+            const ok   = results.filter(r => r.status === 'fulfilled').length;
+            const fail = results.length - ok;
+            if (fail === 0) showToast(`${ok} cópia(s) cancelada(s).`, 'success');
+            else showToast(`${ok} cancelada(s), ${fail} falharam. Tente novamente.`);
         };
 
         window.applyReportFilter = async () => {
@@ -949,10 +1229,17 @@
             document.getElementById('statCanceled').innerText = canceled.length;
             document.getElementById('statCanceledValue').innerText = canceled.length ? fmt(canceledTotal) + ' perdidos' : 'Nenhum no período';
 
-            // Gráfico: pedidos por hora (linha com gradiente) — somente ativos
+            // Gráfico: pedidos por hora — SOMENTE ativos (cancelados ficam fora).
+            // Filtro redundante e timestamp válido garantem que nenhum cancelado nem pedido
+            // com timestamp quebrado caia em "00h".
             const hrs = Array.from({length: 24}, (_, i) => `${String(i).padStart(2,'0')}h`);
             const dataHrs = Array(24).fill(0);
-            active.forEach(o => dataHrs[new Date(o.timestamp).getHours()]++);
+            active
+                .filter(o => o && o.status !== 'cancelado' && Number.isFinite(safeNum(o.timestamp)) && safeNum(o.timestamp) > 0)
+                .forEach(o => {
+                    const h = new Date(safeNum(o.timestamp)).getHours();
+                    if (h >= 0 && h <= 23) dataHrs[h]++;
+                });
             renderChartLine('chartTime', hrs, dataHrs);
 
             // Gráfico: top produtos (barras horizontais) — somente ativos
@@ -961,9 +1248,23 @@
             const top = Object.entries(prodCount).sort((a,b) => b[1] - a[1]).slice(0, 8);
             renderChartBar('chartProducts', top.map(p => p[0]), top.map(p => p[1]));
 
-            // Gráfico: formas de pagamento (pizza) — somente ativos
+            // Gráfico: formas de pagamento (pizza) — somente ativos.
+            // Suporta o.payments (split): conta cada forma 1 vez por pedido.
             const payCount = {};
-            active.forEach(o => { const k = (o.payment || 'Não informado').toUpperCase(); payCount[k] = (payCount[k] || 0) + 1; });
+            active.forEach(o => {
+                if (Array.isArray(o.payments) && o.payments.length) {
+                    const seen = new Set();
+                    for (const p of o.payments) {
+                        const k = String(p.method || 'Não informado').toUpperCase();
+                        if (seen.has(k)) continue;
+                        seen.add(k);
+                        payCount[k] = (payCount[k] || 0) + 1;
+                    }
+                } else {
+                    const k = (o.payment || 'Não informado').toUpperCase();
+                    payCount[k] = (payCount[k] || 0) + 1;
+                }
+            });
             renderChartDoughnut('chartPayment', Object.keys(payCount), Object.values(payCount));
 
             // Tabela de entregas — mostra todos os pedidos, cancelados com badge visual
@@ -986,7 +1287,7 @@
                     <td class="px-4 py-2.5 whitespace-nowrap text-xs text-gray-500 font-bold">${d.toLocaleDateString('pt-BR')} <span class="text-gray-400">${timeStr}</span></td>
                     <td class="px-4 py-2.5 font-bold text-gray-800 max-w-[140px] truncate ${isCanceled ? 'line-through' : ''}">${escapeHtml(o.customer?.name || '-')}${cancelBadge}</td>
                     <td class="px-4 py-2.5 text-gray-500 max-w-[130px] truncate">${escapeHtml(o.customer?.neighborhood || '-')}</td>
-                    <td class="px-4 py-2.5">${isCanceled ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-red-100 text-red-600">-</span>' : payBadge(o.payment)}</td>
+                    <td class="px-4 py-2.5">${isCanceled ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-black uppercase bg-red-100 text-red-600">-</span>' : payBadge(paymentLabel(o))}</td>
                     <td class="px-4 py-2.5 text-right font-bold text-orange-600 text-xs">${isCanceled ? '-' : 'R$ ' + fee.toFixed(2)}</td>
                     <td class="px-4 py-2.5 text-right font-black text-gray-800 ${isCanceled ? 'line-through' : ''}">${isCanceled ? '-' : 'R$ ' + tot.toFixed(2)}</td>
                 </tr>`;
@@ -1054,9 +1355,14 @@
         }
 
         window.filterProducts = () => {
-            const term = document.getElementById('productSearch').value.toLowerCase();
+            const term = (document.getElementById('productSearch').value || '').toLowerCase();
             const catId = document.getElementById('categoryFilter').value;
-            const filtered = window.products.filter(p => (p.name.toLowerCase().includes(term) || (p.desc && p.desc.toLowerCase().includes(term))) && (catId === 'all' || p.cat === catId));
+            // B02: produto sem `name` derrubava a lista inteira via TypeError. Defensa com `|| ''`.
+            const filtered = window.products.filter(p => {
+                const name = (p.name || '').toLowerCase();
+                const desc = (p.desc || '').toLowerCase();
+                return (name.includes(term) || desc.includes(term)) && (catId === 'all' || p.cat === catId);
+            });
             document.getElementById('productCounter').innerText = `${filtered.length} encontrados`;
             renderProducts(filtered);
         };
@@ -1183,15 +1489,17 @@
             }
             out += dashLine();
             // Totais
-            const sub = (safeNum(o.total) - safeNum(o.fee)).toFixed(2);
+            // B04: se fee > total (dado importado errado), subtotal negativo confunde o entregador.
+            const sub = Math.max(0, safeNum(o.total) - safeNum(o.fee)).toFixed(2);
             out += escRow('Subtotal:', sub);
             out += escRow('TAXA:', safeNum(o.fee).toFixed(2));
             out += CMD.BOLD_ON + CMD.DOUBLE_HEIGHT;
             out += escRow('TOTAL:', safeNum(o.total).toFixed(2));
             out += CMD.NORMAL_SIZE + CMD.BOLD_OFF + dashLine();
-            // Pagamento
-            out += stripAccents(`PAGAMENTO: ${(o.payment || '').toUpperCase()}`) + LF_B;
-            if (o.change) out += stripAccents(`TROCO: ${o.change}`) + LF_B;
+            // Pagamento (suporta split via o.payments + troco calculado de o.cashReceived)
+            out += stripAccents(`PAGAMENTO: ${paymentLabel(o).toUpperCase()}`) + LF_B;
+            const troco = changeLabel(o);
+            if (troco) out += stripAccents(`TROCO: ${troco}`) + LF_B;
             out += dashLine();
             // Rodapé
             out += CMD.ALIGN_CENTER + stripAccents(shop.footer) + LF_B;
@@ -1250,13 +1558,21 @@
 
         // Salvar impressora escolhida no Firebase
         window.savePrinterSettings = async () => {
-            const name = document.getElementById('printerSelect').value;
+            if (!requireRole('manager', 'salvar impressora')) return;
+            const name  = document.getElementById('printerSelect').value;
+            const width = document.getElementById('printerWidth').value || '80mm';
             window.settings.printerName  = name;
-            window.settings.printerWidth = document.getElementById('printerWidth').value || '80mm';
+            window.settings.printerWidth = width;
             try {
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), window.settings);
+                // setDoc com merge:true — atualiza só esses 2 campos sem sobrescrever o doc inteiro
+                // (evita race com saveShopInfo/saveSettings) e cria o doc se for a primeira gravação.
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), {
+                    printerName: name,
+                    printerWidth: width
+                }, { merge: true });
                 updateQzStatus(qzReady() ? 'on' : 'off');
-                showToast(name ? `Impressora salva: ${name} (${window.settings.printerWidth})` : 'Impressora removida (vai usar fallback do navegador).', 'success');
+                showToast(name ? `Impressora salva: ${name} (${width})` : 'Impressora removida (vai usar fallback do navegador).', 'success');
+                logAudit('settings.printer', 'config', null, { printerName: name, printerWidth: width });
             } catch (e) {
                 showToast('Erro ao salvar: ' + e.message);
             }
@@ -1306,12 +1622,13 @@
                 address: (window.settings || {}).shopAddress || 'AVENIDA ATLÂNTICA 3480',
                 footer:  (window.settings || {}).shopFooter  || 'Obrigado pela preferência!'
             };
-            const sub = (safeNum(o.total) - safeNum(o.fee)).toFixed(2);
+            // B04: se fee > total (dado importado errado), subtotal negativo confunde o entregador.
+            const sub = Math.max(0, safeNum(o.total) - safeNum(o.fee)).toFixed(2);
             let addressStr = `CLIENTE: ${escapeHtml(o.customer.name)}<br>TEL: ${escapeHtml(o.customer.phone || 'N/A')}<br>END: ${escapeHtml(o.customer.street)}, ${escapeHtml(o.customer.number)}<br>BAIRRO: ${escapeHtml(o.customer.neighborhood)}`;
             if(o.customer.cep) addressStr += `<br>CEP: ${escapeHtml(o.customer.cep)}`;
             if(o.customer.complement) addressStr += `<br>COMPL: ${escapeHtml(o.customer.complement)}`;
             if(o.customer.reference) addressStr += `<br>REF: ${escapeHtml(o.customer.reference)}`;
-            const content = `<div class="print-header">${escapeHtml(shop.name)}</div><div class="print-subheader">${escapeHtml(shop.address)}</div><div class="print-line"></div><div class="print-section text-center">PEDIDO: #${o.id.slice(-4).toUpperCase()}<br>${new Date(o.timestamp).toLocaleString()}</div><div class="print-line"></div><div class="print-section">${addressStr}</div><div class="print-line"></div><div class="print-section">${o.items.map(i=>`<div class="print-row"><span>${safeNum(i.qty)}x ${escapeHtml(i.name)}</span><span>${safeNum(i.price).toFixed(2)}</span></div>`).join('')}</div><div class="print-line"></div><div class="print-section"><div class="print-row"><span>Subtotal:</span><span>${sub}</span></div><div class="print-row"><span>TAXA:</span><span>${safeNum(o.fee).toFixed(2)}</span></div><div class="print-row" style="font-size:16px"><span>TOTAL:</span><span>${safeNum(o.total).toFixed(2)}</span></div></div><div class="print-line"></div><div class="print-section uppercase">PAGAMENTO: ${escapeHtml(o.payment)} ${o.change ? `<br>TROCO: ${escapeHtml(o.change)}` : ''}</div><div class="print-line"></div><div class="print-center">${escapeHtml(shop.footer)}</div>`;
+            const content = `<div class="print-header">${escapeHtml(shop.name)}</div><div class="print-subheader">${escapeHtml(shop.address)}</div><div class="print-line"></div><div class="print-section text-center">PEDIDO: #${o.id.slice(-4).toUpperCase()}<br>${new Date(o.timestamp).toLocaleString()}</div><div class="print-line"></div><div class="print-section">${addressStr}</div><div class="print-line"></div><div class="print-section">${o.items.map(i=>`<div class="print-row"><span>${safeNum(i.qty)}x ${escapeHtml(i.name)}</span><span>${safeNum(i.price).toFixed(2)}</span></div>`).join('')}</div><div class="print-line"></div><div class="print-section"><div class="print-row"><span>Subtotal:</span><span>${sub}</span></div><div class="print-row"><span>TAXA:</span><span>${safeNum(o.fee).toFixed(2)}</span></div><div class="print-row" style="font-size:16px"><span>TOTAL:</span><span>${safeNum(o.total).toFixed(2)}</span></div></div><div class="print-line"></div><div class="print-section uppercase">PAGAMENTO: ${escapeHtml(paymentLabel(o))} ${changeLabel(o) ? `<br>TROCO: ${escapeHtml(changeLabel(o))}` : ''}</div><div class="print-line"></div><div class="print-center">${escapeHtml(shop.footer)}</div>`;
             document.getElementById('printableArea').innerHTML = content;
             window.print();
         }
@@ -1354,23 +1671,36 @@
             document.getElementById('prodModal').classList.remove('hidden');
         };
 
-        window.saveProduct = async () => { 
-            const id = document.getElementById('editId').value; 
-            const data = { 
-                name: document.getElementById('editName').value, 
-                price: parseFloat(document.getElementById('editPrice').value), 
-                img: document.getElementById('editImg').value, 
-                desc: document.getElementById('editDesc').value, 
-                cat: document.getElementById('editCat').value, 
-                active: document.getElementById('editActive').checked 
-            }; 
-            
+        window.saveProduct = async () => {
+            if (!requireRole('manager', 'salvar produto')) return;
+            const id   = document.getElementById('editId').value;
+            const name = document.getElementById('editName').value.trim();
+            const price = parseFloat(document.getElementById('editPrice').value);
+            const cat   = document.getElementById('editCat').value;
+            // Validações que faltavam: nome obrigatório, preço numérico em faixa permitida,
+            // categoria existente (B08).
+            if (!name)                                                 return showToast('Nome do produto é obrigatório.');
+            if (name.length > 120)                                     return showToast('Nome muito longo (máx 120 caracteres).');
+            if (!Number.isFinite(price) || price < 0 || price > 99999) return showToast('Preço inválido.');
+            if (!cat)                                                  return showToast('Selecione uma categoria.');
+            if (!window.categories.some(c => c.id === cat))            return showToast('Categoria inexistente.');
+            const data = {
+                name,
+                price,
+                img:    document.getElementById('editImg').value.trim().slice(0, 200),
+                desc:   document.getElementById('editDesc').value.trim().slice(0, 200),
+                cat,
+                active: document.getElementById('editActive').checked
+            };
+
             try {
-                if(id) { 
-                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), data, { merge: true }); 
-                    document.getElementById('prodModal').classList.add('hidden'); 
-                } else { 
-                    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'products'), data); 
+                if (id) {
+                    const before = window.products.find(p => p.id === id) || null;
+                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), data, { merge: true });
+                    document.getElementById('prodModal').classList.add('hidden');
+                    logAudit('product.update', id, before, data);
+                } else {
+                    const ref = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'products'), data);
                     const feedback = document.getElementById('saveFeedback');
                     feedback.classList.remove('hidden');
                     setTimeout(() => feedback.classList.add('hidden'), 2000);
@@ -1379,13 +1709,26 @@
                     document.getElementById('editImg').value = '';
                     document.getElementById('editDesc').value = '';
                     document.getElementById('editName').focus();
-                } 
+                    logAudit('product.create', ref.id, null, data);
+                }
             } catch(e) {
                 showToast("Erro ao salvar: " + e.message);
             }
         };
 
-        window.deleteProduct = async () => { if(confirm("Excluir?")) { try { await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', document.getElementById('editId').value)); document.getElementById('prodModal').classList.add('hidden'); } catch (e) { showToast("Erro ao excluir: " + e.message); } } };
+        window.deleteProduct = async () => {
+            if (!requireRole('owner', 'excluir produto')) return;
+            if (!confirm("Excluir? Esta ação não pode ser desfeita.")) return;
+            const id = document.getElementById('editId').value;
+            const before = window.products.find(p => p.id === id) || null;
+            try {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id));
+                document.getElementById('prodModal').classList.add('hidden');
+                logAudit('product.delete', id, before, null);
+            } catch (e) {
+                showToast("Erro ao excluir: " + e.message);
+            }
+        };
         window.openProductModal = () => {
             document.getElementById('editId').value = '';
             document.getElementById('editName').value = '';
@@ -1399,10 +1742,12 @@
         window.closeModal = () => document.getElementById('prodModal').classList.add('hidden');
         window.openBulkModal = () => document.getElementById('bulkModal').classList.remove('hidden');
         window.processBulkUpload = async () => {
+            if (!requireRole('manager', 'importar produtos')) return;
             const raw = document.getElementById('bulkInput').value.trim().split('\n');
             if (raw.length > 500) return showToast('Limite de 500 linhas por importação. Divida o arquivo.');
             const batch = writeBatch(db);
             const col = collection(db, 'artifacts', appId, 'public', 'data', 'products');
+            const validCats = new Set(window.categories.map(c => c.id));
             let count = 0;
             const errors = [];
             raw.forEach((line, i) => {
@@ -1416,10 +1761,15 @@
                     errors.push(`Linha ${i+1}: preço inválido ("${price}")`);
                     return;
                 }
+                const finalCat = (cat || 'outros');
+                if (!validCats.has(finalCat)) {
+                    errors.push(`Linha ${i+1}: categoria "${finalCat}" não existe`);
+                    return;
+                }
                 batch.set(doc(col), {
                     name: name.slice(0,120),
                     price: parsedPrice,
-                    cat: (cat || 'outros').slice(0,40),
+                    cat: finalCat.slice(0,40),
                     img: (img || '📦').slice(0,200),
                     desc: (desc || '').slice(0,200),
                     active: true
@@ -1431,12 +1781,14 @@
                 await batch.commit();
                 showToast(`${count} produto(s) importado(s)!`, 'success');
                 document.getElementById('bulkModal').classList.add('hidden');
+                logAudit('product.bulkImport', '-', null, null, { count });
             } catch (e) {
                 showToast('Erro ao importar: ' + e.message);
             }
         };
         window.renderCategories = () => { document.getElementById('categoriesListAdmin').innerHTML = window.categories.map((c, i) => `<div class="bg-white p-3 rounded flex justify-between border items-center font-bold"><span>${escapeHtml(c.name)}</span><button onclick="remCat(${i})" class="text-red-500">&times;</button></div>`).join(''); };
         window.addCategory = async () => {
+            if (!requireRole('manager', 'adicionar categoria')) return;
             const raw = (document.getElementById('newCatName').value || '').trim();
             if (!raw) return;
             // ID determinístico: sem acentos, sem espaços, só alfanumérico + underscore
@@ -1452,12 +1804,14 @@
                 renderCategories();
                 updateCategoryFilterOptions();
                 document.getElementById('newCatName').value = '';
+                logAudit('category.create', id, null, { id, name: raw });
             } catch (e) {
                 window.categories.pop();
                 showToast("Erro ao adicionar categoria: " + e.message);
             }
         };
         window.remCat = async (i) => {
+            if (!requireRole('manager', 'remover categoria')) return;
             const cat = window.categories[i];
             const inUse = window.products.filter(p => p.cat === cat.id).length;
             const msg = inUse > 0
@@ -1465,8 +1819,15 @@
                 : `Remover a categoria "${cat.name}"?`;
             if (!confirm(msg)) return;
             const removed = window.categories.splice(i, 1);
-            try { await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'categories'), { items: window.categories }); renderCategories(); updateCategoryFilterOptions(); }
-            catch (e) { window.categories.splice(i, 0, ...removed); showToast("Erro ao remover: " + e.message); }
+            try {
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'categories'), { items: window.categories });
+                renderCategories();
+                updateCategoryFilterOptions();
+                logAudit('category.delete', cat.id, cat, null, { inUseProducts: inUse });
+            } catch (e) {
+                window.categories.splice(i, 0, ...removed);
+                showToast("Erro ao remover: " + e.message);
+            }
         };
         window.updateCategoryFilterOptions = () => { document.getElementById('categoryFilter').innerHTML = '<option value="all">Todas as Categorias</option>' + window.categories.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)}</option>`).join(''); };
         
@@ -1482,9 +1843,19 @@
 
             // Favicon dinâmico: logo se houver, senão SVG com primeira letra do nome na cor primária
             const fav = document.getElementById('faviconEl');
+            // Aceita só http(s) ou data:image — evita scheme javascript: como href.
+            const safeUrl = (v) => {
+                try {
+                    const u = new URL(v, location.href);
+                    if (u.protocol === 'http:' || u.protocol === 'https:') return v;
+                    if (u.protocol === 'data:' && /^data:image\//.test(v)) return v;
+                } catch (_) {}
+                return '';
+            };
             if (fav) {
-                if (window.settings.shopLogo) {
-                    fav.href = window.settings.shopLogo;
+                const logoOk = safeUrl(window.settings.shopLogo);
+                if (logoOk) {
+                    fav.href = logoOk;
                 } else {
                     const letter = name.charAt(0) || 'A';
                     const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='${color}'/><text x='50%' y='55%' text-anchor='middle' font-size='40' font-weight='900' fill='%230a0a0a' font-family='Arial'>${letter}</text></svg>`;
@@ -1498,6 +1869,8 @@
             document.getElementById('admOpenMin').value = window.settings.openMinute || 0;
             document.getElementById('admClose').value = window.settings.closeHour || 0;
             document.getElementById('admCloseMin').value = window.settings.closeMinute || 0;
+            // Atualiza o banner "fora do horário" imediatamente após carregar/configurar.
+            updateBusinessHoursBanner();
             document.getElementById('regionsListAdm').innerHTML = (window.settings.regions || []).map((r, i) => `<div class="flex justify-between border-b p-2 items-center bg-white mb-1 rounded font-bold"><span>${escapeHtml(r.name)}</span><span>R$ ${escapeHtml(String(r.price))}</span><button onclick="remReg(${i})" class="text-red-500">&times;</button></div>`).join(''); 
             // Dados da empresa
             document.getElementById('shopName').value     = window.settings.shopName     || '';
@@ -1522,6 +1895,8 @@
         };
 
         window.saveShopInfo = async () => {
+            // Só dono altera dados sensíveis da empresa (WhatsApp/CNPJ/cor/logo).
+            if (!requireRole('owner', 'alterar dados da empresa')) return;
             const name = document.getElementById('shopName').value.trim();
             if (!name) { showToast('Nome da loja é obrigatório.'); return; }
 
@@ -1543,23 +1918,31 @@
             const city = document.getElementById('shopCity').value.trim();
             if (!city) { showToast('Cidade de entrega é obrigatória.'); return; }
 
-            window.settings.shopName     = name;
-            window.settings.shopAddress  = document.getElementById('shopAddress').value.trim();
-            window.settings.shopCity     = city;
-            window.settings.shopPhone    = document.getElementById('shopPhone').value.trim();
-            window.settings.shopWhatsapp = whatsapp;
-            window.settings.shopCnpj     = document.getElementById('shopCnpj').value.trim();
-            window.settings.shopTagline  = document.getElementById('shopTagline').value.trim();
-            window.settings.shopFooter   = document.getElementById('shopFooter').value.trim();
-            window.settings.shopLogo     = document.getElementById('shopLogo').value.trim();
-            window.settings.shopColor    = color;
+            // Payload mínimo — update parcial pra evitar race com saveSettings/savePrinterSettings.
+            const payload = {
+                shopName:     name,
+                shopAddress:  document.getElementById('shopAddress').value.trim(),
+                shopCity:     city,
+                shopPhone:    document.getElementById('shopPhone').value.trim(),
+                shopWhatsapp: whatsapp,
+                shopCnpj:     document.getElementById('shopCnpj').value.trim(),
+                shopTagline:  document.getElementById('shopTagline').value.trim(),
+                shopFooter:   document.getElementById('shopFooter').value.trim(),
+                shopLogo:     document.getElementById('shopLogo').value.trim(),
+                shopColor:    color
+            };
+            const before = {};
+            for (const k of Object.keys(payload)) before[k] = window.settings[k];
+            Object.assign(window.settings, payload);
             const saveBtn = document.querySelector('[onclick="saveShopInfo()"]');
             const origHtml = saveBtn ? saveBtn.innerHTML : '';
             if (saveBtn) { saveBtn.disabled = true; saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Salvando...'; }
             try {
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), window.settings);
+                // setDoc com merge:true cria o doc na primeira vez; updateDoc falharia se config não existisse.
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), payload, { merge: true });
                 updateBranding();
                 if (saveBtn) { saveBtn.innerHTML = '<i class="fas fa-check mr-1"></i> Salvo!'; setTimeout(() => { saveBtn.disabled = false; saveBtn.innerHTML = origHtml; }, 1500); }
+                logAudit('settings.shopInfo', 'config', before, payload);
             } catch (e) {
                 showToast('Erro ao salvar: ' + e.message);
                 if (saveBtn) { saveBtn.disabled = false; saveBtn.innerHTML = origHtml; }
@@ -1578,6 +1961,7 @@
         }, 0);
         
         window.saveSettings = async () => {
+            if (!requireRole('manager', 'salvar horário')) return;
             const openH    = parseInt(document.getElementById('admOpen').value);
             const openMin  = parseInt(document.getElementById('admOpenMin').value) || 0;
             const closeH   = parseInt(document.getElementById('admClose').value);
@@ -1586,27 +1970,127 @@
             if (isNaN(closeH) || closeH < 0 || closeH > 23) return showToast('Horário de fechamento inválido. Use um valor entre 0 e 23.');
             if (openMin  < 0 || openMin  > 59) return showToast('Minuto de abertura inválido. Use um valor entre 0 e 59.');
             if (closeMin < 0 || closeMin > 59) return showToast('Minuto de fechamento inválido. Use um valor entre 0 e 59.');
-            window.settings.openHour    = openH;
-            window.settings.openMinute  = openMin;
-            window.settings.closeHour   = closeH;
-            window.settings.closeMinute = closeMin;
+            const before = {
+                openHour: window.settings.openHour, openMinute: window.settings.openMinute,
+                closeHour: window.settings.closeHour, closeMinute: window.settings.closeMinute
+            };
+            const payload = { openHour: openH, openMinute: openMin, closeHour: closeH, closeMinute: closeMin };
+            Object.assign(window.settings, payload);
             const btn = document.querySelector('[onclick="saveSettings()"]');
             const orig = btn ? btn.innerHTML : '';
             if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Salvando...'; }
             try {
-                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), window.settings);
+                // merge:true — não sobrescreve os outros campos de config.
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), payload, { merge: true });
                 if (btn) { btn.innerHTML = '<i class="fas fa-check mr-1"></i> Salvo!'; setTimeout(() => { btn.disabled = false; btn.innerHTML = orig; }, 1500); }
+                logAudit('settings.hours', 'config', before, payload);
             } catch (e) {
                 showToast('Erro ao salvar: ' + e.message);
                 if (btn) { btn.disabled = false; btn.innerHTML = orig; }
             }
         };
-        
-        window.addRegion = async () => { const name = document.getElementById('newRegName').value; const price = parseFloat(document.getElementById('newRegPrice').value); if(!name || isNaN(price)) return; if(!window.settings.regions) window.settings.regions = []; window.settings.regions.push({name, price}); try { await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), window.settings); renderSettings(); document.getElementById('newRegName').value = ''; document.getElementById('newRegPrice').value = ''; } catch (e) { window.settings.regions.pop(); showToast("Erro ao adicionar bairro: " + e.message); } };
-        window.remReg = async (i) => { if(confirm("Remover?")) { const removed = window.settings.regions.splice(i, 1); try { await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'), window.settings); renderSettings(); } catch (e) { window.settings.regions.splice(i, 0, ...removed); showToast("Erro ao remover: " + e.message); } } };
+
+        window.addRegion = async () => {
+            if (!requireRole('manager', 'adicionar bairro')) return;
+            const name = (document.getElementById('newRegName').value || '').trim();
+            const price = parseFloat(document.getElementById('newRegPrice').value);
+            if (!name) return showToast('Informe o bairro.');
+            if (!Number.isFinite(price) || price < 0 || price > 999) return showToast('Preço inválido (entre 0 e 999).');
+            if (!window.settings.regions) window.settings.regions = [];
+            if (window.settings.regions.some(r => r.name.toLowerCase() === name.toLowerCase())) {
+                return showToast('Bairro já cadastrado.');
+            }
+            window.settings.regions.push({ name, price });
+            try {
+                await setDoc(
+                    doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'),
+                    { regions: window.settings.regions },
+                    { merge: true }
+                );
+                renderSettings();
+                document.getElementById('newRegName').value = '';
+                document.getElementById('newRegPrice').value = '';
+                logAudit('region.create', name, null, { name, price });
+            } catch (e) {
+                window.settings.regions.pop();
+                showToast("Erro ao adicionar bairro: " + e.message);
+            }
+        };
+        window.remReg = async (i) => {
+            if (!requireRole('manager', 'remover bairro')) return;
+            if (!confirm("Remover?")) return;
+            const removed = window.settings.regions.splice(i, 1);
+            try {
+                await setDoc(
+                    doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config'),
+                    { regions: window.settings.regions },
+                    { merge: true }
+                );
+                renderSettings();
+                logAudit('region.delete', removed[0]?.name || '-', removed[0] || null, null);
+            } catch (e) {
+                window.settings.regions.splice(i, 0, ...removed);
+                showToast("Erro ao remover: " + e.message);
+            }
+        };
         window.toggleSound = () => { soundEnabled = !soundEnabled; const btn = document.getElementById('soundBtn'); btn.innerHTML = soundEnabled ? '<i class="fas fa-volume-up"></i> Som Ativado' : '<i class="fas fa-volume-mute"></i> Som Mudo'; if (!soundEnabled) stopHorn(); };
         window.showTab = (id) => { ['orders', 'reports', 'products', 'categories', 'settings'].forEach(t => { document.getElementById(`tab-${t}`).classList.add('hidden'); document.getElementById(`nav-${t}`).classList.remove('bg-gray-800', 'text-brava-yellow', 'font-bold'); }); document.getElementById(`tab-${id}`).classList.remove('hidden'); document.getElementById(`nav-${id}`).classList.add('bg-gray-800', 'text-brava-yellow', 'font-bold'); if(id === 'reports') applyReportFilter(); };
         window.toggleReportInputs = () => { const type = document.getElementById('reportFilterType').value; document.getElementById('reportFilterDate').classList.toggle('hidden', type !== 'custom_date'); };
+
+        // ====================================================================
+        //  Horário de funcionamento — banner + confirmação ao aceitar fora do horário
+        // ====================================================================
+        function isWithinBusinessHours() {
+            const s = window.settings || {};
+            // Se horários não estão configurados, considera sempre aberto (compat).
+            const oH = Number.isFinite(s.openHour)  ? s.openHour  : null;
+            const oM = Number.isFinite(s.openMinute) ? s.openMinute : 0;
+            const cH = Number.isFinite(s.closeHour) ? s.closeHour : null;
+            const cM = Number.isFinite(s.closeMinute) ? s.closeMinute : 0;
+            if (oH === null || cH === null) return true;
+            const now = new Date();
+            const cur   = now.getHours() * 60 + now.getMinutes();
+            const open  = oH * 60 + oM;
+            const close = cH * 60 + cM;
+            // Aceita "atravessa meia-noite" (ex: 18h → 02h)
+            return open <= close
+                ? (cur >= open && cur < close)
+                : (cur >= open || cur < close);
+        }
+
+        function updateBusinessHoursBanner() {
+            const banner = document.getElementById('offHoursBanner');
+            const txt    = document.getElementById('offHoursBannerText');
+            if (!banner) return;
+            const open = isWithinBusinessHours();
+            banner.classList.toggle('hidden', open);
+            if (!open && txt) {
+                const s = window.settings || {};
+                const fmt = (h, m) => `${String(h ?? 0).padStart(2,'0')}:${String(m ?? 0).padStart(2,'0')}`;
+                txt.innerText = `Loja fora do horário (${fmt(s.openHour, s.openMinute)}–${fmt(s.closeHour, s.closeMinute)}). Aceitar pedidos exige confirmação.`;
+            }
+        }
+        setInterval(updateBusinessHoursBanner, 60 * 1000);
+
+        // Wrap updateOrderStatus: aceitar (NOVO→PREPARO) pede confirmação extra em dois cenários —
+        // fora do horário OU pedido suspeito de duplicata.
+        const _origUpdateOrderStatus = window.updateOrderStatus;
+        window.updateOrderStatus = async (id, status) => {
+            if (status === 'preparo') {
+                const dup = window._dupMap?.get(id);
+                if (dup && !dup.isOldest) {
+                    if (!confirm(`Este pedido é PROVÁVEL CÓPIA (${dup.groupSize} pedidos iguais em 5 min). Aceitar mesmo assim?`)) return;
+                } else if (dup && dup.isOldest && dup.groupIds.length > 1) {
+                    if (!confirm(`Existem ${dup.groupIds.length - 1} cópia(s) deste pedido. Quer aceitar SÓ este e cancelar as cópias?`)) return;
+                    // Cancela as cópias em background; mantém este pra aceitação.
+                    window.cancelDuplicatesOf(id, { skipConfirm: true });
+                }
+                if (!isWithinBusinessHours()) {
+                    if (!confirm('A loja está FORA do horário de funcionamento. Aceitar mesmo assim?')) return;
+                }
+            }
+            return _origUpdateOrderStatus(id, status);
+        };
 
         // Captura global de erros JS — armazena em localStorage para diagnóstico sem Sentry
         window.onerror = (msg, src, line, col, err) => {
@@ -1622,7 +2106,7 @@
         });
 
         // Mostra email do admin logado no badge
-        onAuthStateChanged(auth, (u) => { const el = document.getElementById('adminUserEmail'); if (el && u) el.innerText = u.email || u.uid.slice(0,8); });
+        // (badge do email do admin é setado no onAuthStateChanged principal, com o `role` anexado)
 
         // Exportar CSV do extrato de entregas
         window._lastReportOrders = [];
@@ -1638,7 +2122,7 @@
                     '#' + (o.id || '').slice(-4).toUpperCase(),
                     o.customer?.name || '',
                     o.customer?.neighborhood || '',
-                    o.payment || '',
+                    paymentLabel(o),
                     safeNum(o.fee).toFixed(2),
                     safeNum(o.total).toFixed(2)
                 ]);

@@ -1,0 +1,122 @@
+rules_version = '2';
+
+// =================================================================
+//  Firestore Security Rules — Pede AI Admin
+// -----------------------------------------------------------------
+//  Modelo:
+//   - Multi-tenant: cada loja vive em `artifacts/{tenant}/...`.
+//   - Cliente final (anônimo): cria pedido, lê cardápio público.
+//   - Admin autenticado: lê tudo da própria loja, edita conforme `role`.
+//   - Roles via Custom Claims do Firebase Auth:
+//        owner   -> tudo
+//        manager -> tudo, exceto trocar dados sensíveis da empresa
+//        cashier -> ler + atualizar status de pedido
+//
+//  Pré-deploy (executar UMA vez no Admin SDK — ver scripts/setup-claims.js):
+//      admin.auth().setCustomUserClaims(uid, { tenantId: 'loja-padrao', role: 'owner' });
+//
+//  Sem o claim setado, o usuário é tratado como anônimo (negado).
+// =================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function tenantId() {
+      return request.auth.token.tenantId;
+    }
+    function role() {
+      return request.auth.token.role;
+    }
+    function isTenantMember(tenant) {
+      return isSignedIn() && tenantId() == tenant;
+    }
+    function isOwner(tenant) {
+      return isTenantMember(tenant) && role() == 'owner';
+    }
+    function isManager(tenant) {
+      return isTenantMember(tenant) && (role() == 'owner' || role() == 'manager');
+    }
+    function isCashier(tenant) {
+      return isTenantMember(tenant) && (role() == 'owner' || role() == 'manager' || role() == 'cashier');
+    }
+
+    // Validação mínima de schema do pedido criado pelo cliente final.
+    function validNewOrder(d) {
+      return d.keys().hasAll(['customer','items','total','timestamp','status'])
+          && d.status == 'novo'
+          && d.total is number && d.total >= 0 && d.total <= 100000
+          && d.timestamp is number
+          && d.items is list && d.items.size() > 0 && d.items.size() <= 100
+          && d.customer is map
+          && d.customer.name is string && d.customer.name.size() > 0 && d.customer.name.size() <= 120
+          && d.customer.phone is string && d.customer.phone.size() <= 30;
+    }
+
+    // ---------- cardápio público (leitura anônima) ----------
+    match /artifacts/{tenant}/public/data/products/{prodId} {
+      allow read: if true;
+      allow write: if isManager(tenant);
+    }
+    match /artifacts/{tenant}/public/data/settings/categories {
+      allow read: if true;
+      allow write: if isManager(tenant);
+    }
+    match /artifacts/{tenant}/public/data/settings/config {
+      allow read: if true;
+      // 'owner' altera dados da empresa (WhatsApp, CNPJ, cor).
+      // 'manager' pode tocar horário, impressora e regiões, mas não shopName/shopWhatsapp/shopCnpj/shopColor.
+      allow update: if isOwner(tenant)
+        || (isManager(tenant)
+            && !request.resource.data.diff(resource.data).affectedKeys()
+                 .hasAny(['shopName','shopWhatsapp','shopCnpj','shopColor','shopLogo']));
+      allow create, delete: if isOwner(tenant);
+    }
+
+    // ---------- pedidos ----------
+    match /artifacts/{tenant}/public/data/orders/{orderId} {
+      // Cliente final (sem auth) pode CRIAR pedido com schema validado.
+      allow create: if validNewOrder(request.resource.data);
+
+      // Listagem/leitura: somente admin do tenant.
+      allow read: if isCashier(tenant);
+
+      // Atualização de status: cashier OK.
+      // Cancelamento exige motivo (cancelReason).
+      allow update: if isCashier(tenant)
+        && (
+          // Update simples de status (sem cancelar)
+          (request.resource.data.status != 'cancelado')
+          ||
+          // Cancelamento exige campos de auditoria
+          (request.resource.data.status == 'cancelado'
+            && request.resource.data.cancelReason is string
+            && request.resource.data.cancelReason.size() > 0
+            && request.resource.data.canceledBy is string)
+        );
+
+      // Delete só owner (em geral, prefira manter histórico).
+      allow delete: if isOwner(tenant);
+    }
+
+    // ---------- audit log (append-only, privado) ----------
+    match /artifacts/{tenant}/private/audit/log/{entryId} {
+      allow read: if isOwner(tenant);
+      // Qualquer admin autenticado do tenant pode escrever entrada,
+      // mas só insert — nunca edita ou apaga.
+      allow create: if isCashier(tenant)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.ts is number;
+      allow update, delete: if false;
+    }
+
+    // ---------- catch-all ----------
+    // Nega qualquer documento não mapeado explicitamente.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
