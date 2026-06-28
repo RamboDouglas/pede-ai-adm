@@ -45,9 +45,12 @@ service cloud.firestore {
     }
 
     // Validação mínima de schema do pedido criado pelo cliente final.
+    // `ownerUid` é obrigatório — o cardápio carimba o UID anônimo do Firebase Auth
+    // e a rule confere que bate com request.auth.uid.
     function validNewOrder(d) {
-      return d.keys().hasAll(['customer','items','total','timestamp','status'])
+      return d.keys().hasAll(['customer','items','total','timestamp','status','ownerUid'])
           && d.status == 'novo'
+          && d.ownerUid is string && d.ownerUid.size() > 0
           && d.total is number && d.total >= 0 && d.total <= 100000
           && d.timestamp is number
           && d.items is list && d.items.size() > 0 && d.items.size() <= 100
@@ -78,11 +81,19 @@ service cloud.firestore {
 
     // ---------- pedidos ----------
     match /artifacts/{tenant}/public/data/orders/{orderId} {
-      // Cliente final (sem auth) pode CRIAR pedido com schema validado.
-      allow create: if validNewOrder(request.resource.data);
+      // Cliente final (autenticado anonimamente) cria o próprio pedido.
+      // O `ownerUid` precisa bater com `request.auth.uid` — isso impede que
+      // alguém crie pedido carimbado com UID de terceiros.
+      allow create: if request.auth != null
+        && validNewOrder(request.resource.data)
+        && request.resource.data.ownerUid == request.auth.uid;
 
-      // Listagem/leitura: somente admin do tenant.
-      allow read: if isCashier(tenant);
+      // Leitura: admin do tenant (vê tudo) OU o próprio dono do pedido
+      // (cliente vê só os seus, identificado por ownerUid).
+      // Sem isso, a tela "Acompanhar Pedido" do cardápio fica vazia e o
+      // cliente acha que o pedido não foi → spammar o botão → duplicatas.
+      allow read: if isCashier(tenant)
+        || (request.auth != null && resource.data.ownerUid == request.auth.uid);
 
       // Atualização de status: cashier OK.
       // Cancelamento exige motivo (cancelReason).
