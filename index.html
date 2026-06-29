@@ -623,6 +623,17 @@
         const escapeHtml = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         const safeNum = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
+        // S2F: valida o campo de imagem do produto. Aceita emoji/texto curto OU URL http(s).
+        // Bloqueia javascript:/data: e lixo. Devolve '' quando inválido.
+        const isHttpUrl = (s) => /^https?:\/\//i.test(String(s || ''));
+        function safeImgUrl(v) {
+            const s = String(v || '').trim();
+            if (!s) return '';
+            if (!isHttpUrl(s)) return s.length <= 8 ? s : '';   // emoji ok; string longa não-URL = lixo
+            try { const u = new URL(s); return (u.protocol === 'http:' || u.protocol === 'https:') ? s : ''; }
+            catch { return ''; }
+        }
+
         // Detecção de pedidos duplicados.
         // Cenário real: cliente clicou 3x em "finalizar" no celular e mandou o mesmo pedido em 30s.
         // O bloqueio definitivo precisa ficar no app que CRIA o pedido (debounce do botão);
@@ -876,37 +887,76 @@
                 .finally(() => { btn.disabled = false; btn.innerText = "ENTRAR"; });
         };
 
-        // Persistência LOCAL para que F5 mantenha sessão; idle timer abaixo controla expiração.
+        // Persistência LOCAL: F5 mantém a sessão. NÃO há logout automático por
+        // inatividade — ver nota mais abaixo (painel é receptor de pedidos sempre ligado).
         setPersistence(auth, browserLocalPersistence).catch(e => console.warn('setPersistence:', e));
 
-        // Mantém a sessão e controla o acesso ao painel via estado de autenticação
+        // Mantém a sessão e controla o acesso ao painel via estado de autenticação.
         let dashboardStarted = false;
+        let _unsubs = [];   // todos os onSnapshot ativos — encerrados no logout
+
+        // B1B+B1C: encerra todos os listeners e zera o estado do tenant anterior.
+        // Sem isso, trocar de conta na mesma aba deixava os listeners do tenant
+        // antigo vivos (com o appId antigo capturado no closure) e podia renderizar
+        // dados de outra loja, além de gerar 'permission-denied' no console.
+        function teardownDashboard() {
+            _unsubs.forEach(u => { try { u(); } catch(_) {} });
+            _unsubs = [];
+            dashboardStarted = false;
+            window._orderMap = {};
+            window._dupMap = new Map();
+            window.allOrdersCache = [];
+            window.products = [];
+            window.categories = [];
+            window.settings = {};
+            try { stopAlert(); } catch(_) {}
+        }
+
         onAuthStateChanged(auth, async (user) => {
             currentUser = user;
-            if (user) {
-                // Lê Custom Claims (tenantId + role). Sem claim, mantém o legado: appId='loja-padrao' / role='owner'.
-                try {
-                    const tok = await user.getIdTokenResult();
-                    if (tok.claims.tenantId) appId = String(tok.claims.tenantId);
-                    if (tok.claims.role)     currentRole = String(tok.claims.role);
-                } catch (e) {
-                    console.warn('getIdTokenResult falhou — usando defaults:', e.message);
-                }
-                applyRoleVisibility();
-                document.getElementById('loginScreen').classList.add('hidden');
-                document.getElementById('dashboard').classList.remove('hidden');
-                const emailEl = document.getElementById('adminUserEmail');
-                if (emailEl) emailEl.innerText = (user.email || user.uid.slice(0,8)) + ` · ${currentRole}`;
-                if (!dashboardStarted) { initDashboard(); dashboardStarted = true; }
-                primeAlertSystem(); // Desbloqueia áudio + pede permissão de notificação após login (gesto válido)
-                updateOnlineStatus();
-                connectQZSilent(); // tenta QZ Tray em background
-                startIdleTimer();
-            } else {
-                stopIdleTimer();
+            if (!user) {
+                teardownDashboard();              // encerra listeners + limpa estado ao sair
+                currentRole = 'cashier';          // reseta para o menor privilégio
+                appId = 'loja-padrao';
                 document.getElementById('dashboard').classList.add('hidden');
                 document.getElementById('loginScreen').classList.remove('hidden');
+                return;
             }
+
+            // Lê Custom Claims (tenantId + role).
+            let tenantId = null, role = null, tokenRead = false;
+            try {
+                const tok = await user.getIdTokenResult();
+                tenantId = tok.claims.tenantId || null;
+                role     = tok.claims.role || null;
+                tokenRead = true;
+            } catch (e) {
+                console.warn('getIdTokenResult falhou:', e.message);
+            }
+
+            // S2C: token lido com sucesso MAS sem claims => conta criada no Console
+            // sem rodar setup-claims => bloqueia. Não deixa cair em 'loja-padrao'/'owner'
+            // por engano (fallback silencioso era o risco).
+            if (tokenRead && (!tenantId || !role)) {
+                showToast('Sua conta ainda não foi configurada. Peça ao dono para liberar seu acesso.', 'error');
+                await signOut(auth);
+                return;
+            }
+            // Token NÃO pôde ser lido (rede instável): não desloga — evita travar o
+            // dono num blip de internet —, mas entra com o menor privilégio até o
+            // claim ser confirmado num refresh seguinte.
+            appId       = tenantId ? String(tenantId) : 'loja-padrao';
+            currentRole = role ? String(role) : 'cashier';   // B1A: default seguro (era 'owner')
+
+            applyRoleVisibility();
+            document.getElementById('loginScreen').classList.add('hidden');
+            document.getElementById('dashboard').classList.remove('hidden');
+            const emailEl = document.getElementById('adminUserEmail');
+            if (emailEl) emailEl.innerText = (user.email || user.uid.slice(0,8)) + ` · ${currentRole}`;
+            if (!dashboardStarted) { initDashboard(); dashboardStarted = true; }
+            primeAlertSystem(); // Desbloqueia áudio + pede permissão de notificação após login (gesto válido)
+            updateOnlineStatus();
+            connectQZSilent(); // tenta QZ Tray em background
         });
 
         // Esconde elementos marcados com data-min-role quando o usuário não tem permissão.
@@ -919,34 +969,17 @@
 
         window.logout = () => signOut(auth);
 
-        // Logout por inatividade — em terminal de loja compartilhado, sessão eterna é risco.
-        const IDLE_LIMIT_MS = 30 * 60 * 1000;  // 30 minutos
-        let _idleTimer = null;
-        function startIdleTimer() {
-            stopIdleTimer();
-            const reset = () => {
-                clearTimeout(_idleTimer);
-                _idleTimer = setTimeout(() => {
-                    showToast('Sessão encerrada por inatividade.', 'info');
-                    signOut(auth);
-                }, IDLE_LIMIT_MS);
-            };
-            ['click','keydown','mousemove','touchstart'].forEach(ev =>
-                document.addEventListener(ev, reset, { passive: true })
-            );
-            window._idleResetFn = reset;
-            reset();
-        }
-        function stopIdleTimer() {
-            clearTimeout(_idleTimer);
-            _idleTimer = null;
-            if (window._idleResetFn) {
-                ['click','keydown','mousemove','touchstart'].forEach(ev =>
-                    document.removeEventListener(ev, window._idleResetFn, { passive: true })
-                );
-                window._idleResetFn = null;
-            }
-        }
+        // ====================================================================
+        //  NOTA: logout automático por inatividade foi REMOVIDO de propósito.
+        //  Este painel é um receptor de pedidos "sempre ligado" — fica numa
+        //  tela/balcão recebendo pedidos o dia todo. Um timeout de inatividade
+        //  (30 min sem mexer o mouse) deslogava o painel em horários parados,
+        //  escondendo o dashboard e fazendo PERDER pedidos (sem buzina, sem
+        //  card aparecendo). Em terminal compartilhado, o controle é físico +
+        //  o botão "Sair". Se um dia precisar de bloqueio por inatividade, faça
+        //  com tela de bloqueio (re-PIN) em vez de signOut, pra não derrubar a
+        //  recepção de pedidos.
+        // ====================================================================
 
         // Recuperação de senha — antes, dono esquecido só com Console Firebase aberto.
         window.forgotPassword = async () => {
@@ -1000,6 +1033,21 @@
             _reportRefreshTimer = setTimeout(() => applyReportFilter(), 1500);
         }
 
+        // F3E: conta pedidos 'novo' que esta máquina ainda NÃO alertou (por ID, em localStorage).
+        // Reabrir o painel não re-toca a buzina para pedidos antigos; só pedido realmente novo alarma.
+        function countUnseenNovos(orders) {
+            let seen;
+            try { seen = new Set(JSON.parse(localStorage.getItem('_seenNovos') || '[]')); }
+            catch { seen = new Set(); }
+            const novoIds = (orders || []).filter(o => o && o.status === 'novo').map(o => o.id);
+            const fresh = novoIds.filter(id => !seen.has(id));
+            if (novoIds.length) {
+                const merged = [...new Set([...seen, ...novoIds])].slice(-500);
+                try { localStorage.setItem('_seenNovos', JSON.stringify(merged)); } catch(_) {}
+            }
+            return fresh.length;
+        }
+
         function initDashboard() {
             // Filtra "hoje" já no Firestore. Antes, o limit(500) global podia engolir
             // os pedidos do dia em loja movimentada (pedidos antigos ocupavam as 500 vagas).
@@ -1010,7 +1058,7 @@
                 orderBy('timestamp', 'desc'),
                 limit(500)
             );
-            onSnapshot(q, (snap) => {
+            _unsubs.push(onSnapshot(q, (snap) => {
                 const todayStr = new Date().toLocaleDateString('pt-BR');
                 window.allOrdersCache = snap.docs.map(d => ({id: d.id, ...d.data()}));
 
@@ -1129,23 +1177,50 @@
                 historyList.innerHTML = htmlHistory;
                 document.getElementById('pendingCount').innerText = pendingCount;
                 document.getElementById('pendingCount').classList.toggle('hidden', pendingCount === 0);
-                if(pendingCount > 0 && soundEnabled) { playAlert(pendingCount); } else { stopAlert(); }
+                // F3E: só toca a buzina para pedidos 'novo' que esta máquina ainda NÃO alertou.
+                // Evita re-alarmar pedidos antigos ao reabrir o painel (fadiga de alerta).
+                const freshNovos = countUnseenNovos(window.allOrdersCache);
+                if (freshNovos > 0 && soundEnabled) { playAlert(pendingCount); }
+                else if (pendingCount === 0) { stopAlert(); }
                 scheduleReportRefresh();
-            }, (err) => updateOnlineStatus(err));
+            }, (err) => updateOnlineStatus(err)));
 
             getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'categories')).then(s => { if(s.exists()){ window.categories = s.data().items; renderCategories(); updateCategoryFilterOptions(); } }).catch(e => console.warn('Categorias:', e)).finally(() => {
-                onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'products'), (s) => { window.products = s.docs.map(d => ({id: d.id, ...d.data()})); filterProducts(); });
+                _unsubs.push(onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'products'), (s) => { window.products = s.docs.map(d => ({id: d.id, ...d.data()})); filterProducts(); }));
             });
             getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'config')).then(s => { if(s.exists()){ window.settings = s.data(); renderSettings(); updateBranding(); } });
         }
 
+        // Aceitar/avançar pedido. Lógica única (sem monkey-patch — B1F):
+        //  - guard de clique-duplo por pedido (B1G)
+        //  - confirmação extra de duplicata e fora-de-horário ao ACEITAR (novo→preparo)
+        // isWithinBusinessHours/cancelDuplicatesOf são chamadas em runtime (no clique),
+        // quando já estão definidas — ok mesmo aparecendo depois no arquivo.
+        const _orderInFlight = new Set();
         window.updateOrderStatus = async (id, status) => {
             if (!requireRole('cashier', 'atualizar pedido')) return;
+            if (_orderInFlight.has(id)) return;   // B1G: ignora segundo clique no mesmo pedido
+            if (status === 'preparo') {
+                const dup = window._dupMap?.get(id);
+                if (dup && !dup.isOldest) {
+                    if (!confirm(`Este pedido é PROVÁVEL CÓPIA (${dup.groupSize} pedidos iguais em 5 min). Aceitar mesmo assim?`)) return;
+                } else if (dup && dup.isOldest && dup.groupIds.length > 1) {
+                    if (!confirm(`Existem ${dup.groupIds.length - 1} cópia(s) deste pedido. Quer aceitar SÓ este e cancelar as cópias?`)) return;
+                    window.cancelDuplicatesOf(id, { skipConfirm: true });
+                }
+                if (typeof isWithinBusinessHours === 'function' && !isWithinBusinessHours()
+                    && !confirm('A loja está FORA do horário de funcionamento. Aceitar mesmo assim?')) return;
+            }
+            _orderInFlight.add(id);
             const before = window._orderMap?.[id];
             try {
                 await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id), { status });
                 logAudit('order.status', id, { status: before?.status }, { status });
-            } catch (e) { showToast("Erro ao atualizar pedido: " + e.message); }
+            } catch (e) {
+                showToast("Erro ao atualizar pedido: " + e.message);
+            } finally {
+                _orderInFlight.delete(id);
+            }
         };
         window.cancelOrder = async (id) => {
             if (!requireRole('cashier', 'cancelar pedido')) return;
@@ -1247,6 +1322,7 @@
                 if (truncated) {
                     showToast('Relatório truncado em 2000 pedidos — refine o período pra ver tudo.', 'info');
                 }
+                window._lastReportLabel = label;   // F3F: usado no nome do arquivo CSV
                 calculateReports(filtered);
             } catch (e) {
                 document.getElementById('statPeriodLabel').innerText = label;
@@ -1414,7 +1490,7 @@
 
         window.renderProducts = (list) => {
             document.getElementById('productsListAdmin').innerHTML = list.map(p => `<div class="p-4 flex justify-between items-center hover:bg-gray-50 border-l-4 ${p.active === false ? 'border-red-400 bg-red-50' : 'border-green-400'}" onclick="editProduct('${p.id}')">
-                <div class="flex items-center gap-4"><div class="w-12 h-12 rounded border bg-white flex items-center justify-center text-2xl overflow-hidden">${(p.img && p.img.includes('http')) ? `<img src="${escapeHtml(p.img)}" class="w-full h-full object-cover" onerror="this.style.display='none'">` : escapeHtml(p.img || '📦')}</div>
+                <div class="flex items-center gap-4"><div class="w-12 h-12 rounded border bg-white flex items-center justify-center text-2xl overflow-hidden">${isHttpUrl(p.img) ? `<img src="${escapeHtml(p.img)}" class="w-full h-full object-cover" onerror="this.style.display='none'">` : escapeHtml(p.img || '📦')}</div>
                 <div><div class="font-bold ${p.active === false ? 'line-through opacity-50' : ''}">${escapeHtml(p.name)}</div><div class="text-xs text-gray-500 font-bold">R$ ${safeNum(p.price).toFixed(2)}</div></div></div><i class="fas fa-pen text-gray-300"></i></div>`).join('');
         };
 
@@ -1662,6 +1738,11 @@
         //  só é usado em caso de falha — mas continua funcional.
         // ====================================================================
         function legacyPrintOrder(o) {
+            // F3C: pedido malformado não pode imprimir ticket pela metade.
+            if (!o || !o.customer || !Array.isArray(o.items)) {
+                showToast('Pedido incompleto — não foi possível imprimir.');
+                return;
+            }
             const shop = {
                 name:    (window.settings || {}).shopName    || 'BRAVA CONVENIENCIA',
                 address: (window.settings || {}).shopAddress || 'AVENIDA ATLÂNTICA 3480',
@@ -1732,7 +1813,7 @@
             const data = {
                 name,
                 price,
-                img:    document.getElementById('editImg').value.trim().slice(0, 200),
+                img:    safeImgUrl(document.getElementById('editImg').value).slice(0, 200),
                 desc:   document.getElementById('editDesc').value.trim().slice(0, 200),
                 cat,
                 active: document.getElementById('editActive').checked
@@ -2122,31 +2203,21 @@
         }
         setInterval(updateBusinessHoursBanner, 60 * 1000);
 
-        // Wrap updateOrderStatus: aceitar (NOVO→PREPARO) pede confirmação extra em dois cenários —
-        // fora do horário OU pedido suspeito de duplicata.
-        const _origUpdateOrderStatus = window.updateOrderStatus;
-        window.updateOrderStatus = async (id, status) => {
-            if (status === 'preparo') {
-                const dup = window._dupMap?.get(id);
-                if (dup && !dup.isOldest) {
-                    if (!confirm(`Este pedido é PROVÁVEL CÓPIA (${dup.groupSize} pedidos iguais em 5 min). Aceitar mesmo assim?`)) return;
-                } else if (dup && dup.isOldest && dup.groupIds.length > 1) {
-                    if (!confirm(`Existem ${dup.groupIds.length - 1} cópia(s) deste pedido. Quer aceitar SÓ este e cancelar as cópias?`)) return;
-                    // Cancela as cópias em background; mantém este pra aceitação.
-                    window.cancelDuplicatesOf(id, { skipConfirm: true });
-                }
-                if (!isWithinBusinessHours()) {
-                    if (!confirm('A loja está FORA do horário de funcionamento. Aceitar mesmo assim?')) return;
-                }
-            }
-            return _origUpdateOrderStatus(id, status);
-        };
+        // (Confirmações de duplicata/fora-de-horário e o guard de clique-duplo agora
+        //  vivem dentro da própria updateOrderStatus — B1F/B1G. Sem monkey-patch.)
 
-        // Captura global de erros JS — armazena em localStorage para diagnóstico sem Sentry
+        // Captura global de erros JS — armazena em localStorage para diagnóstico sem Sentry.
+        // S2D: redige PII (telefone/CEP/email) antes de gravar — em terminal de loja
+        // compartilhado, qualquer um com F12 lê o localStorage. LGPD aplica.
+        const _redactPII = (s) => String(s ?? '')
+            .replace(/\b\d{2}[\s-]?\d{4,5}[\s-]?\d{4}\b/g, '[tel]')   // telefone BR
+            .replace(/\b\d{5}-?\d{3}\b/g, '[cep]')                    // CEP
+            .replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, '[email]')          // email
+            .slice(0, 200);
         window.onerror = (msg, src, line, col, err) => {
             try {
                 const log = JSON.parse(localStorage.getItem('_errLog') || '[]');
-                log.unshift({ ts: new Date().toISOString(), msg: String(msg), src: String(src).split('/').pop(), line, col });
+                log.unshift({ ts: new Date().toISOString(), msg: _redactPII(msg), src: String(src).split('/').pop(), line, col });
                 localStorage.setItem('_errLog', JSON.stringify(log.slice(0, 50)));
             } catch(_) {}
             return false; // não suprime o erro
@@ -2188,7 +2259,9 @@
             const csv = rows.map(r => r.map(v => `"${sanitizeCsvCell(v)}"`).join(',')).join('\r\n');
             const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
             const url = URL.createObjectURL(blob);
-            const a = document.createElement('a'); a.href = url; a.download = `extrato_${new Date().toISOString().slice(0,10)}.csv`; a.click();
+            // F3F: nome do arquivo reflete o período filtrado (não a data de hoje).
+            const periodo = String(window._lastReportLabel || 'periodo').replace(/[^\w]+/g, '_').toLowerCase();
+            const a = document.createElement('a'); a.href = url; a.download = `extrato_${periodo}_${new Date().toISOString().slice(0,10)}.csv`; a.click();
             URL.revokeObjectURL(url);
         };
 
