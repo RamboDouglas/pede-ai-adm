@@ -1565,6 +1565,10 @@
 
         // Monta o ticket completo em bytes ESC/POS
         function buildTicketBytes(o) {
+            // Guarda de robustez (igual legacyPrintOrder): pedido malformado não gera ticket quebrado.
+            if (!o || !o.customer || !Array.isArray(o.items)) {
+                throw new Error('Pedido incompleto para impressão.');
+            }
             const s = window.settings || {};
             const shop = {
                 name:    s.shopName    || 'BRAVA CONVENIENCIA',
