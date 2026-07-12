@@ -595,17 +595,21 @@
         import { getFirestore, collection, onSnapshot, addDoc, doc, updateDoc, deleteDoc, getDoc, getDocs, setDoc, query, where, orderBy, limit, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, sendPasswordResetEmail, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
 
+        // A apiKey do Firebase é pública por design (vai para todo navegador que abre
+        // a página) — quem protege os dados são as firestore.rules. Hardening obrigatório
+        // antes de vender: restringir esta key por referrer HTTP no Google Cloud Console
+        // (APIs & Services > Credentials) e habilitar Firebase App Check.
         const firebaseConfig = { apiKey: "AIzaSyDcLJgd7hRug4DOdZG5pBVADvb8gv50X04", authDomain: "pede-ai-ff294.firebaseapp.com", projectId: "pede-ai-ff294", storageBucket: "pede-ai-ff294.firebasestorage.app", messagingSenderId: "785420254615", appId: "1:785420254615:web:14723281bba318ac9a98d2" };
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
         const auth = getAuth(app);
 
         // appId vira *let* — definitivo depois que o Custom Claim `tenantId` for lido no login.
-        // 'loja-padrao' fica como fallback compatível com o deploy atual (uma loja só),
-        // até todos os usuários terem o claim setado via scripts/setup-claims.js.
+        // 'loja-padrao' é só placeholder pré-login: sem claim lido, o painel NÃO entra
+        // (ver onAuthStateChanged — B09). Todo usuário precisa do claim via scripts/setup-claims.js.
         let appId = 'loja-padrao';
         let currentUser = null;
-        let currentRole = 'owner';  // sem claim: assume owner (modo single-tenant legado)
+        let currentRole = 'cashier';  // menor privilégio até o claim ser lido no login
 
         // Helpers de autorização ----------------------------------------------------
         // Hierarquia: owner > manager > cashier.
@@ -923,30 +927,43 @@
                 return;
             }
 
-            // Lê Custom Claims (tenantId + role).
+            // Lê Custom Claims (tenantId + role). Com retry: o token normalmente
+            // está em cache local e a leitura só falha em blip de rede raro —
+            // 3 tentativas cobrem isso sem derrubar o dono à toa.
             let tenantId = null, role = null, tokenRead = false;
-            try {
-                const tok = await user.getIdTokenResult();
-                tenantId = tok.claims.tenantId || null;
-                role     = tok.claims.role || null;
-                tokenRead = true;
-            } catch (e) {
-                console.warn('getIdTokenResult falhou:', e.message);
+            for (let attempt = 1; attempt <= 3 && !tokenRead; attempt++) {
+                try {
+                    const tok = await user.getIdTokenResult();
+                    tenantId = tok.claims.tenantId || null;
+                    role     = tok.claims.role || null;
+                    tokenRead = true;
+                } catch (e) {
+                    console.warn(`getIdTokenResult falhou (tentativa ${attempt}/3):`, e.message);
+                    if (attempt < 3) await new Promise(r => setTimeout(r, 400 * attempt));
+                }
+            }
+
+            // B09: claim ilegível => NÃO entra. O fallback antigo ('loja-padrao')
+            // apontava o painel para a loja errada num cenário multi-tenant — e
+            // ficava preso nela, porque onAuthStateChanged não re-dispara em
+            // refresh de token, então o "claim confirmado num refresh seguinte"
+            // nunca acontecia. Sem claim lido, trata como erro (igual ao S2C).
+            if (!tokenRead) {
+                showToast('Não foi possível confirmar sua loja (conexão instável). Entre novamente.', 'error');
+                await signOut(auth);
+                return;
             }
 
             // S2C: token lido com sucesso MAS sem claims => conta criada no Console
             // sem rodar setup-claims => bloqueia. Não deixa cair em 'loja-padrao'/'owner'
             // por engano (fallback silencioso era o risco).
-            if (tokenRead && (!tenantId || !role)) {
+            if (!tenantId || !role) {
                 showToast('Sua conta ainda não foi configurada. Peça ao dono para liberar seu acesso.', 'error');
                 await signOut(auth);
                 return;
             }
-            // Token NÃO pôde ser lido (rede instável): não desloga — evita travar o
-            // dono num blip de internet —, mas entra com o menor privilégio até o
-            // claim ser confirmado num refresh seguinte.
-            appId       = tenantId ? String(tenantId) : 'loja-padrao';
-            currentRole = role ? String(role) : 'cashier';   // B1A: default seguro (era 'owner')
+            appId       = String(tenantId);
+            currentRole = String(role);   // B1A: nunca assume role — só entra com claim lido
 
             applyRoleVisibility();
             document.getElementById('loginScreen').classList.add('hidden');
@@ -1035,17 +1052,21 @@
 
         // F3E: conta pedidos 'novo' que esta máquina ainda NÃO alertou (por ID, em localStorage).
         // Reabrir o painel não re-toca a buzina para pedidos antigos; só pedido realmente novo alarma.
+        // countUnseenNovos é PURA (só lê) — quem decide alertar chama markNovosSeen() em seguida.
+        // Antes a leitura já gravava o "visto": uma segunda chamada no mesmo ciclo engolia o alerta.
+        function getSeenNovos() {
+            try { return new Set(JSON.parse(localStorage.getItem('_seenNovos') || '[]')); }
+            catch { return new Set(); }
+        }
         function countUnseenNovos(orders) {
-            let seen;
-            try { seen = new Set(JSON.parse(localStorage.getItem('_seenNovos') || '[]')); }
-            catch { seen = new Set(); }
+            const seen = getSeenNovos();
+            return (orders || []).filter(o => o && o.status === 'novo' && !seen.has(o.id)).length;
+        }
+        function markNovosSeen(orders) {
             const novoIds = (orders || []).filter(o => o && o.status === 'novo').map(o => o.id);
-            const fresh = novoIds.filter(id => !seen.has(id));
-            if (novoIds.length) {
-                const merged = [...new Set([...seen, ...novoIds])].slice(-500);
-                try { localStorage.setItem('_seenNovos', JSON.stringify(merged)); } catch(_) {}
-            }
-            return fresh.length;
+            if (!novoIds.length) return;
+            const merged = [...new Set([...getSeenNovos(), ...novoIds])].slice(-500);
+            try { localStorage.setItem('_seenNovos', JSON.stringify(merged)); } catch(_) {}
         }
 
         function initDashboard() {
@@ -1180,6 +1201,7 @@
                 // F3E: só toca a buzina para pedidos 'novo' que esta máquina ainda NÃO alertou.
                 // Evita re-alarmar pedidos antigos ao reabrir o painel (fadiga de alerta).
                 const freshNovos = countUnseenNovos(window.allOrdersCache);
+                markNovosSeen(window.allOrdersCache);
                 if (freshNovos > 0 && soundEnabled) { playAlert(pendingCount); }
                 else if (pendingCount === 0) { stopAlert(); }
                 scheduleReportRefresh();
@@ -1673,7 +1695,7 @@
                 const sel = document.getElementById('printerSelect');
                 const current = window.settings.printerName || '';
                 sel.innerHTML = '<option value="">— nenhuma selecionada (usa fallback do navegador) —</option>' +
-                    printers.map(p => `<option value="${p}" ${p === current ? 'selected' : ''}>${p}</option>`).join('');
+                    printers.map(p => `<option value="${escapeHtml(p)}" ${p === current ? 'selected' : ''}>${escapeHtml(p)}</option>`).join('');
                 showToast(`${printers.length} impressora(s) encontrada(s).`, 'success');
             } catch (err) {
                 updateQzStatus('off');
@@ -1967,8 +1989,11 @@
             if (brand) brand.innerText = name;
             document.title = `${name} | Painel`;
 
-            // Cor primária via CSS variable
-            const color = window.settings.shopColor || '#FFD700';
+            // Cor primária via CSS variable. Valida o hex AQUI também, não só no
+            // saveShopInfo: o doc pode ser gravado por outra via (import, console,
+            // backend futuro) e a cor entra crua no SVG do favicon abaixo.
+            const rawColor = window.settings.shopColor || '#FFD700';
+            const color = /^#[0-9A-Fa-f]{6}$/.test(rawColor) ? rawColor : '#FFD700';
             document.documentElement.style.setProperty('--brand-primary', color);
 
             // Favicon dinâmico: logo se houver, senão SVG com primeira letra do nome na cor primária
@@ -1987,7 +2012,10 @@
                 if (logoOk) {
                     fav.href = logoOk;
                 } else {
-                    const letter = name.charAt(0) || 'A';
+                    // Só letra/dígito no SVG — shopName vem do Firestore e um char
+                    // como < ou ' quebraria/injetaria markup no data:image/svg+xml.
+                    const first = name.charAt(0);
+                    const letter = /^[0-9A-Za-zÀ-ÖØ-öø-ÿ]$/.test(first) ? first : 'A';
                     const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='${color}'/><text x='50%' y='55%' text-anchor='middle' font-size='40' font-weight='900' fill='%230a0a0a' font-family='Arial'>${letter}</text></svg>`;
                     fav.href = 'data:image/svg+xml,' + encodeURIComponent(svg);
                 }
@@ -2019,7 +2047,9 @@
             // Mostra a impressora salva no dropdown (mesmo sem ter detectado ainda)
             const sel = document.getElementById('printerSelect');
             if (sel && window.settings.printerName) {
-                sel.innerHTML = `<option value="${window.settings.printerName}" selected>${window.settings.printerName}</option><option value="">— remover —</option>`;
+                // printerName vem do Firestore (gravável por manager) — escapa como todo o resto.
+                const pn = escapeHtml(window.settings.printerName);
+                sel.innerHTML = `<option value="${pn}" selected>${pn}</option><option value="">— remover —</option>`;
             }
             updateQzStatus(qzReady() ? 'on' : 'off');
         };

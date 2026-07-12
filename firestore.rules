@@ -95,12 +95,19 @@ service cloud.firestore {
       allow read: if isCashier(tenant)
         || (request.auth != null && resource.data.ownerUid == request.auth.uid);
 
-      // Atualização de status: cashier OK.
-      // Cancelamento exige motivo (cancelReason).
+      // Atualização: cashier só transiciona status (+ campos de auditoria do
+      // cancelamento). B09: sem a trava de affectedKeys, um cashier podia
+      // reescrever total/items/customer/ownerUid/timestamp de qualquer pedido.
+      // O painel só escreve {status} e {status,cancelReason,canceledBy,canceledAt}.
       allow update: if isCashier(tenant)
+        // Nunca reescrever itens/valor/cliente/dono do pedido.
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status','cancelReason','canceledBy','canceledAt'])
+        // Pedido cancelado é imutável — não existe "descancelar".
+        && resource.data.status != 'cancelado'
         && (
-          // Update simples de status (sem cancelar)
-          (request.resource.data.status != 'cancelado')
+          // Update simples de status (sem cancelar): só valores conhecidos
+          (request.resource.data.status in ['novo','preparo','entrega','concluido'])
           ||
           // Cancelamento exige campos de auditoria
           (request.resource.data.status == 'cancelado'

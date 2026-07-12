@@ -34,9 +34,24 @@ Painel admin single-file para o sistema de delivery **Pede-aí**.
 
 - XSS sanitizado via `escapeHtml()` em todos os pontos de saída HTML
 - Validação de entrada em formulários (nome, preço, horários, WhatsApp, cor hex)
-- Regras de acesso configuradas no **Firebase Firestore Rules**
-- Favicon dinâmico com cor validada por regex antes de injetar no SVG
-- Log de erros JS em `localStorage` para diagnóstico sem Sentry
+- Regras de acesso configuradas no **Firebase Firestore Rules** — update de pedido
+  travado por `affectedKeys()` (cashier só muda status + auditoria de cancelamento;
+  pedido cancelado é imutável)
+- Login exige Custom Claim (`tenantId` + `role`) legível — sem claim, não entra
+  (nada de fallback silencioso para outra loja)
+- Favicon dinâmico com cor e letra validadas por regex antes de injetar no SVG
+- Log de erros JS em `localStorage` para diagnóstico sem Sentry (PII redigida)
+
+## Testes
+
+Funções puras (assinatura de duplicata, horário de funcionamento, impressão,
+sanitização) têm testes unitários extraídos direto do `index.html`:
+
+```bash
+node --test tests/*.test.mjs   # Node 18+, zero dependências
+```
+
+O GitHub Actions (`.github/workflows/ci.yml`) roda a suíte em cada push/PR.
 
 ## Impressora Térmica
 
