@@ -58,3 +58,13 @@ O GitHub Actions (`.github/workflows/ci.yml`) roda a suíte em cada push/PR.
 Requer o [QZ Tray](https://qz.io/download/) instalado e rodando na máquina.
 Na primeira conexão, clique em **Configurações → Detectar Impressoras**, selecione a impressora e salve.
 Em produção, configure `QZ_CERT_PEM` e `QZ_SIGN_ENDPOINT` no código para eliminar o popup de segurança.
+
+## Backend (Cloud Functions)
+
+O diretório [`functions/`](functions/) contém Cloud Functions v2 em TypeScript:
+
+- **`setUserClaims`** — owner do tenant cria/revoga acesso de outros usuários (substitui `scripts/setup-claims.js`)
+- **`listTenantUsers`** — lista usuários do tenant (owner/manager)
+- **`onOrderWrite`** — trigger que grava audit log server-side de todo pedido
+
+Ver [`functions/README.md`](functions/README.md) para setup, emulador e deploy.
