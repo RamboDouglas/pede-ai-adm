@@ -4,3 +4,13 @@ scripts/serviceAccountKey.json
 .firebase/
 .runtimeconfig.json
 node_modules/
+
+# Firebase Functions build artifacts
+functions/lib/
+functions/node_modules/
+
+# Emulator + logs
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+*-debug.log
