@@ -13,6 +13,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      # Testes unitários das funções puras extraídas do index.html
-      # (node:test nativo — sem package.json/dependências de propósito).
-      - run: node --test tests/*.test.mjs
+      # Testes unitários: funções puras extraídas do index.html + validações
+      # do backend (functions/helpers.js). node:test nativo, zero dependências.
+      - run: node --test tests/*.test.mjs functions/*.test.mjs

@@ -4,3 +4,5 @@ scripts/serviceAccountKey.json
 .firebase/
 .runtimeconfig.json
 node_modules/
+# Params/segredos locais das Cloud Functions
+functions/.env*

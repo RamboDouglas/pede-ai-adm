@@ -1,6 +1,12 @@
 // =================================================================
 //  setup-claims.js — Setar tenantId + role nos usuários do Firebase Auth.
 // -----------------------------------------------------------------
+//  PAPEL ATUAL: bootstrap do PRIMEIRO owner de uma loja (tenant novo).
+//  O dia a dia (adicionar caixa/gerente, trocar papel, revogar acesso)
+//  agora é feito pelo próprio dono no painel — Configurações → Equipe —
+//  via backend em functions/index.js. Este script fica para quem opera
+//  o SaaS criar lojas novas.
+//
 //  Execute ANTES de fazer o deploy das novas firestore.rules.
 //  Sem isso, ninguém entra no painel (rules exigem o claim).
 //

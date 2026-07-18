@@ -30,6 +30,38 @@ Painel admin single-file para o sistema de delivery **Pede-aí**.
 2. Faça login com o e-mail e senha cadastrados no **Firebase Authentication**
 3. Configure os dados da loja na aba **Configurações**
 
+## Backend (Cloud Functions)
+
+O painel é 100% front, mas Custom Claims (`tenantId` + `role`) só podem ser
+gravados pelo Admin SDK — por isso existe o backend em `functions/`:
+
+| Callable | Quem chama | O que faz |
+|---|---|---|
+| `setStaffClaims` | owner | Libera/atualiza acesso de um e-mail da própria loja (cria a conta se não existir) |
+| `listStaff` | owner | Lista a equipe do tenant |
+| `removeStaffAccess` | owner | Revoga o acesso (limpa claims + derruba sessões) |
+
+O isolamento entre lojas é validado **no servidor**: um owner só enxerga e
+altera contas do próprio `tenantId`. Toda operação grava no audit log do
+tenant (`artifacts/{tenant}/private/audit/log`).
+
+**Deploy** (exige plano Blaze — as functions têm free tier generoso):
+
+```bash
+cd functions && npm install && cd ..
+firebase deploy --only functions
+```
+
+No painel, a seção **Configurações → Equipe** (visível só para owner) consome
+esses endpoints. Conta nova é criada sem senha — a pessoa define a dela pelo
+**"Esqueci a senha"** na tela de login.
+
+O `scripts/setup-claims.js` continua existindo para o **bootstrap do primeiro
+owner de uma loja nova** (decisão de quem opera o SaaS, não do lojista).
+
+Próximo passo natural do backend: endpoint de assinatura do QZ Tray
+(`QZ_SIGN_ENDPOINT` no `index.html`) quando houver certificado, e App Check.
+
 ## Segurança
 
 - XSS sanitizado via `escapeHtml()` em todos os pontos de saída HTML
@@ -45,10 +77,11 @@ Painel admin single-file para o sistema de delivery **Pede-aí**.
 ## Testes
 
 Funções puras (assinatura de duplicata, horário de funcionamento, impressão,
-sanitização) têm testes unitários extraídos direto do `index.html`:
+sanitização) têm testes unitários extraídos direto do `index.html`, e as
+validações do backend são testadas em `functions/helpers.test.mjs`:
 
 ```bash
-node --test tests/*.test.mjs   # Node 18+, zero dependências
+node --test tests/*.test.mjs functions/*.test.mjs   # Node 18+, zero dependências
 ```
 
 O GitHub Actions (`.github/workflows/ci.yml`) roda a suíte em cada push/PR.

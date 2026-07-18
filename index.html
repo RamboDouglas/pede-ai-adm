@@ -21,7 +21,7 @@
         font-src 'self' data: https://cdnjs.cloudflare.com;
         img-src 'self' data: https: blob:;
         media-src 'self' https://cdn.freesound.org;
-        connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://firestore.googleapis.com wss://*.firebaseio.com wss://localhost:* ws://localhost:* https://localhost:* http://localhost:*;
+        connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://firestore.googleapis.com https://*.cloudfunctions.net https://*.a.run.app wss://*.firebaseio.com wss://localhost:* ws://localhost:* https://localhost:* http://localhost:*;
         frame-src 'none';
         object-src 'none';
         base-uri 'self';
@@ -391,7 +391,35 @@
                 </div>
                 <div class="bg-blue-50 border border-blue-200 rounded-xl p-4 flex items-start gap-3 text-xs text-blue-800">
                     <i class="fas fa-users mt-0.5 shrink-0"></i>
-                    <span><strong>Controle de acesso:</strong> múltiplos admins podem ser cadastrados no <a href="https://console.firebase.google.com/" target="_blank" class="underline font-bold">Firebase Authentication Console</a>. Todos os usuários autenticados têm acesso total — para permissões diferenciadas (gerente vs. dono), configure <strong>Custom Claims</strong> via Firebase Admin SDK.</span>
+                    <span><strong>Controle de acesso:</strong> cada membro da equipe entra com o próprio e-mail e um papel — <strong>Dono</strong> (tudo), <strong>Gerente</strong> (tudo, menos dados da empresa) ou <strong>Caixa</strong> (só pedidos). O dono gerencia os acessos na seção <strong>Equipe</strong> abaixo.</span>
+                </div>
+
+                <div class="bg-white p-6 rounded-lg shadow space-y-3" data-min-role="owner">
+                    <h3 class="font-bold border-b pb-2 flex items-center gap-2">
+                        <i class="fas fa-users text-gray-600"></i> Equipe (acesso ao painel)
+                    </h3>
+                    <p class="text-xs text-gray-500">Libere o acesso por e-mail. Conta nova é criada sem senha — a pessoa usa <strong>"Esqueci a senha"</strong> na tela de login para definir a dela.</p>
+                    <div class="flex gap-2 flex-wrap items-end">
+                        <div class="flex-1 min-w-[220px]">
+                            <label class="text-xs font-bold text-gray-500">E-mail</label>
+                            <input type="email" id="staffEmail" class="border p-2 w-full rounded text-sm" placeholder="caixa@minhaloja.com" maxlength="254">
+                        </div>
+                        <div>
+                            <label class="text-xs font-bold text-gray-500">Papel</label>
+                            <select id="staffRole" class="border p-2 rounded text-sm h-[38px]">
+                                <option value="cashier">Caixa</option>
+                                <option value="manager">Gerente</option>
+                                <option value="owner">Dono</option>
+                            </select>
+                        </div>
+                        <button onclick="grantStaffAccess()" id="btnStaffGrant" class="bg-blue-600 text-white px-4 py-2 rounded font-bold text-sm">
+                            <i class="fas fa-user-plus mr-1"></i> Liberar acesso
+                        </button>
+                    </div>
+                    <div id="staffList" class="text-xs text-gray-400">Clique em "Atualizar lista" para carregar a equipe.</div>
+                    <button onclick="refreshStaffList()" id="btnStaffRefresh" class="text-xs font-bold text-blue-600 hover:underline">
+                        <i class="fas fa-rotate-right mr-1"></i> Atualizar lista
+                    </button>
                 </div>
 
                 <div class="bg-white p-6 rounded-lg shadow space-y-3">
@@ -594,6 +622,7 @@
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getFirestore, collection, onSnapshot, addDoc, doc, updateDoc, deleteDoc, getDoc, getDocs, setDoc, query, where, orderBy, limit, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, sendPasswordResetEmail, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFunctions, httpsCallable } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-functions.js";
 
         // A apiKey do Firebase é pública por design (vai para todo navegador que abre
         // a página) — quem protege os dados são as firestore.rules. Hardening obrigatório
@@ -603,6 +632,9 @@
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
         const auth = getAuth(app);
+        // Backend (Cloud Functions) — a região precisa bater com o setGlobalOptions
+        // de functions/index.js, senão o callable resolve para URL inexistente.
+        const fns = getFunctions(app, 'southamerica-east1');
 
         // appId vira *let* — definitivo depois que o Custom Claim `tenantId` for lido no login.
         // 'loja-padrao' é só placeholder pré-login: sem claim lido, o painel NÃO entra
@@ -2106,6 +2138,85 @@
             } catch (e) {
                 showToast('Erro ao salvar: ' + e.message);
                 if (saveBtn) { saveBtn.disabled = false; saveBtn.innerHTML = origHtml; }
+            }
+        };
+
+        // ====================================================================
+        //  Equipe — gestão de acesso via backend (functions/index.js).
+        //  O front NÃO grava Custom Claims (só o Admin SDK pode); aqui a gente
+        //  chama os callables e renderiza. O isolamento por tenant é validado
+        //  no servidor — esta UI é conveniência, não fronteira de segurança.
+        // ====================================================================
+        const ROLE_LABEL = { owner: 'Dono', manager: 'Gerente', cashier: 'Caixa' };
+
+        function staffErrorMessage(e) {
+            const code = String(e?.code || '');
+            // Backend nunca publicado (ou região errada) chega como not-found/unavailable.
+            if (code === 'functions/not-found' || code === 'functions/unavailable') {
+                return 'Backend indisponível. O deploy já foi feito? (firebase deploy --only functions)';
+            }
+            return e?.message || 'Falha na operação. Tente novamente.';
+        }
+
+        window.grantStaffAccess = async () => {
+            if (!requireRole('owner', 'gerenciar a equipe')) return;
+            const email = (document.getElementById('staffEmail').value || '').trim().toLowerCase();
+            const role  = document.getElementById('staffRole').value;
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { showToast('E-mail inválido.'); return; }
+            const btn = document.getElementById('btnStaffGrant');
+            btn.disabled = true;
+            try {
+                const res = await httpsCallable(fns, 'setStaffClaims')({ email, role });
+                const d = res.data || {};
+                showToast(d.created
+                    ? `Conta criada para ${email}. Peça para a pessoa usar "Esqueci a senha" no login.`
+                    : `Acesso de ${email} atualizado para ${ROLE_LABEL[role] || role}.`, 'success');
+                document.getElementById('staffEmail').value = '';
+                refreshStaffList();
+            } catch (e) {
+                showToast(staffErrorMessage(e));
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        window.removeStaffAccess = async (email) => {
+            if (!requireRole('owner', 'gerenciar a equipe')) return;
+            if (!confirm(`Remover o acesso de ${email}? A conta continua no Firebase Auth, mas sem papel não entra no painel.`)) return;
+            try {
+                await httpsCallable(fns, 'removeStaffAccess')({ email });
+                showToast(`Acesso de ${email} removido.`, 'success');
+                refreshStaffList();
+            } catch (e) {
+                showToast(staffErrorMessage(e));
+            }
+        };
+
+        window.refreshStaffList = async () => {
+            if (!requireRole('owner', 'ver a equipe')) return;
+            const list = document.getElementById('staffList');
+            list.innerHTML = '<span class="text-xs text-gray-400"><i class="fas fa-spinner fa-spin mr-1"></i>Carregando equipe...</span>';
+            try {
+                const res = await httpsCallable(fns, 'listStaff')();
+                const staff = (res.data && res.data.staff) || [];
+                if (!staff.length) {
+                    list.innerHTML = '<span class="text-xs text-gray-400">Nenhum membro com acesso ainda.</span>';
+                    return;
+                }
+                const mine = (currentUser?.email || '').toLowerCase();
+                list.innerHTML = staff.map(s => {
+                    const email = escapeHtml(s.email || s.uid);
+                    const isMe = (s.email || '').toLowerCase() === mine;
+                    return `<div class="flex justify-between items-center border-b border-gray-100 py-2 gap-2 text-sm">
+                        <span class="font-bold text-gray-700 break-all">${email}${isMe ? ' <span class="text-[10px] font-normal text-gray-400">(você)</span>' : ''}${s.disabled ? ' <span class="text-[10px] font-normal text-red-400">(desativada)</span>' : ''}</span>
+                        <span class="flex items-center gap-2 shrink-0">
+                            <span class="text-[10px] font-black uppercase bg-gray-100 text-gray-600 px-2 py-0.5 rounded">${escapeHtml(ROLE_LABEL[s.role] || s.role || '?')}</span>
+                            ${isMe ? '' : `<button onclick="removeStaffAccess(this.dataset.email)" data-email="${email}" class="text-red-500 text-xs font-bold hover:underline">remover</button>`}
+                        </span>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                list.innerHTML = `<span class="text-xs text-red-500">${escapeHtml(staffErrorMessage(e))}</span>`;
             }
         };
 
