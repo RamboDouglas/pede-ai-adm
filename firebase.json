@@ -5,7 +5,7 @@
   "functions": [
     {
       "source": "functions",
-      "codebase": "default",
+      "codebase": "admin",
       "runtime": "nodejs20",
       "ignore": [
         "node_modules",

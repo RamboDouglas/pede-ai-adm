@@ -1,21 +1,18 @@
 rules_version = '2';
 
 // =================================================================
-//  Firestore Security Rules — Pede AI Admin
-// -----------------------------------------------------------------
-//  Modelo:
-//   - Multi-tenant: cada loja vive em `artifacts/{tenant}/...`.
-//   - Cliente final (anônimo): cria pedido, lê cardápio público.
-//   - Admin autenticado: lê tudo da própria loja, edita conforme `role`.
-//   - Roles via Custom Claims do Firebase Auth:
-//        owner   -> tudo
-//        manager -> tudo, exceto trocar dados sensíveis da empresa
-//        cashier -> ler + atualizar status de pedido
+//  Firestore Security Rules — Pede AI (Painel Admin)
 //
-//  Pré-deploy (executar UMA vez no Admin SDK — ver scripts/setup-claims.js):
-//      admin.auth().setCustomUserClaims(uid, { tenantId: 'loja-padrao', role: 'owner' });
+//  ⚠️ CÓPIA SINCRONIZADA. A FONTE DA VERDADE destas regras é o repo do
+//  storefront (PEDE-AI-CLIENTE / firestore.rules). Este arquivo existe só
+//  para o painel poder emular/deployar de forma autossuficiente e DEVE
+//  ser mantido IDÊNTICO ao canônico — nunca edite as regras só aqui.
 //
-//  Sem o claim setado, o usuário é tratado como anônimo (negado).
+//  Os dois repos publicam no MESMO projeto Firebase (pede-ai-ff294): como
+//  o conteúdo é idêntico, `firebase deploy --only firestore:rules` a partir
+//  de qualquer um dos repos produz o mesmo resultado (antes, este arquivo
+//  era uma versão antiga e deployá-lo REGREDIA a segurança e podia derrubar
+//  a criação de pedidos do storefront).
 // =================================================================
 
 service cloud.firestore {
@@ -44,19 +41,68 @@ service cloud.firestore {
       return isTenantMember(tenant) && (role() == 'owner' || role() == 'manager' || role() == 'cashier');
     }
 
-    // Validação mínima de schema do pedido criado pelo cliente final.
-    // `ownerUid` é obrigatório — o cardápio carimba o UID anônimo do Firebase Auth
-    // e a rule confere que bate com request.auth.uid.
+    // Bloco do cliente no pedido: schema fechado + limite de tamanho em
+    // todos os campos de texto (sem isso, um doc de pedido aceita até 1MB
+    // de lixo em street/complement/reference).
+    function validCustomer(c) {
+      return c is map
+          && c.keys().hasOnly(['name','phone','street','number','neighborhood','cep','complement','reference'])
+          && c.name is string && c.name.size() > 0 && c.name.size() <= 120
+          && c.phone is string && c.phone.size() <= 30
+          && (!('street' in c)       || (c.street is string       && c.street.size()       <= 120))
+          && (!('number' in c)       || (c.number is string       && c.number.size()       <= 20))
+          && (!('neighborhood' in c) || (c.neighborhood is string && c.neighborhood.size() <= 120))
+          && (!('cep' in c)          || (c.cep is string          && c.cep.size()          <= 20))
+          && (!('complement' in c)   || (c.complement is string   && c.complement.size()   <= 120))
+          && (!('reference' in c)    || (c.reference is string    && c.reference.size()    <= 160));
+    }
+
+    // Pedido novo: schema fechado (hasOnly), tipos e faixas validados,
+    // timestamp coerente com o relógio do servidor (±60 min — mata pedido
+    // retro/pós-datado que polui o painel "hoje" e os relatórios, mas tolera
+    // celular de cliente com relógio desajustado; o timestamp vem de
+    // Date.now() no dispositivo. Precisão real = serverTimestamp na Fase C).
+    // O que rules NÃO conseguem fazer: somar os itens e conferir o total
+    // (CEL não tem loop). Integridade de preço de verdade = Cloud Function.
     function validNewOrder(d) {
-      return d.keys().hasAll(['customer','items','total','timestamp','status','ownerUid'])
+      return d.keys().hasAll(['customer','items','total','timestamp','status'])
+          && d.keys().hasOnly(['customer','items','total','timestamp','status','fee','payment','change','date','ownerUid'])
           && d.status == 'novo'
-          && d.ownerUid is string && d.ownerUid.size() > 0
           && d.total is number && d.total >= 0 && d.total <= 100000
           && d.timestamp is number
+          && d.timestamp > request.time.toMillis() - 3600000
+          && d.timestamp < request.time.toMillis() + 3600000
           && d.items is list && d.items.size() > 0 && d.items.size() <= 100
-          && d.customer is map
-          && d.customer.name is string && d.customer.name.size() > 0 && d.customer.name.size() <= 120
-          && d.customer.phone is string && d.customer.phone.size() <= 30;
+          && validCustomer(d.customer)
+          && (!('fee' in d)      || (d.fee is number && d.fee >= 0 && d.fee <= 999))
+          && (!('payment' in d)  || (d.payment is string && d.payment.size() <= 30))
+          && (!('change' in d)   || (d.change is string && d.change.size() <= 20))
+          && (!('date' in d)     || (d.date is string && d.date.size() <= 40))
+          && (!('ownerUid' in d) || (isSignedIn() && d.ownerUid == request.auth.uid));
+    }
+
+    function knownStatus(s) {
+      return s in ['novo','preparo','entrega','concluido','cancelado'];
+    }
+
+    // Máquina de estados do pedido. 'cancelado' é FINAL e imutável (protege o
+    // registro de cancelamento). Regras adicionais:
+    //  - status desconhecido (doc legado/corrompido) pode voltar ao fluxo
+    //    normal — caminho de reparo que o painel usa (B01);
+    //  - from == to é no-op permitido (exceto 'cancelado') — dois atendentes
+    //    aceitando o mesmo pedido quase juntos não geram erro para o segundo.
+    function validTransition(from, to) {
+      return (!knownStatus(from) && knownStatus(to))
+          || (from == to && knownStatus(from) && from != 'cancelado')
+          || (from == 'novo'    && (to == 'preparo'   || to == 'cancelado'))
+          || (from == 'preparo' && (to == 'entrega'   || to == 'cancelado'))
+          || (from == 'entrega' && (to == 'concluido' || to == 'cancelado'));
+    }
+
+    // Doc legado SEM campo status: acessar resource.data.status daria erro e
+    // negaria o update para sempre — trata como reparável para status conhecido.
+    function validOrderUpdate(res, req) {
+      return !('status' in res) ? knownStatus(req.status) : validTransition(res.status, req.status);
     }
 
     // ---------- cardápio público (leitura anônima) ----------
@@ -70,8 +116,6 @@ service cloud.firestore {
     }
     match /artifacts/{tenant}/public/data/settings/config {
       allow read: if true;
-      // 'owner' altera dados da empresa (WhatsApp, CNPJ, cor).
-      // 'manager' pode tocar horário, impressora e regiões, mas não shopName/shopWhatsapp/shopCnpj/shopColor.
       allow update: if isOwner(tenant)
         || (isManager(tenant)
             && !request.resource.data.diff(resource.data).affectedKeys()
@@ -81,50 +125,50 @@ service cloud.firestore {
 
     // ---------- pedidos ----------
     match /artifacts/{tenant}/public/data/orders/{orderId} {
-      // Cliente final (autenticado anonimamente) cria o próprio pedido.
-      // O `ownerUid` precisa bater com `request.auth.uid` — isso impede que
-      // alguém crie pedido carimbado com UID de terceiros.
-      allow create: if request.auth != null
-        && validNewOrder(request.resource.data)
-        && request.resource.data.ownerUid == request.auth.uid;
+      // Cliente final pode CRIAR pedido com schema fechado e validado.
+      allow create: if validNewOrder(request.resource.data);
 
-      // Leitura: admin do tenant (vê tudo) OU o próprio dono do pedido
-      // (cliente vê só os seus, identificado por ownerUid).
-      // Sem isso, a tela "Acompanhar Pedido" do cardápio fica vazia e o
-      // cliente acha que o pedido não foi → spammar o botão → duplicatas.
+      // ┌──────────────────────────────────────────────────────────────────┐
+      // │ BACKEND OBRIGATÓRIO (fraude de preço impossível) — NÃO LIGADO.     │
+      // │                                                                    │
+      // │ Ao trocar a linha `allow create` acima por `allow create: if false`│
+      // │ NENHUM cliente cria pedido direto — só a Cloud Function createOrder │
+      // │ (admin SDK, que ignora estas rules) grava, sempre com preço/frete   │
+      // │ recalculados no servidor.                                          │
+      // │                                                                    │
+      // │ ⚠️ SEQUÊNCIA OBRIGATÓRIA (fora dela, a loja para de registrar):     │
+      // │   1. publicar as functions:  firebase deploy --only functions      │
+      // │   2. ligar a flag no site:   const USE_BACKEND = true (index.html) │
+      // │   3. testar um pedido de verdade entrando pelo painel              │
+      // │   4. SÓ ENTÃO trocar aqui para `allow create: if false` e          │
+      // │      redeployar as rules:    firebase deploy --only firestore:rules│
+      // └──────────────────────────────────────────────────────────────────┘
+      // allow create: if false;   // ← descomente (e apague o allow acima) no passo 4
+
+      // Staff do tenant lê tudo; cliente anônimo lê só os PRÓPRIOS (ownerUid).
       allow read: if isCashier(tenant)
         || (request.auth != null && resource.data.ownerUid == request.auth.uid);
 
-      // Atualização: cashier só transiciona status (+ campos de auditoria do
-      // cancelamento). B09: sem a trava de affectedKeys, um cashier podia
-      // reescrever total/items/customer/ownerUid/timestamp de qualquer pedido.
-      // O painel só escreve {status} e {status,cancelReason,canceledBy,canceledAt}.
+      // Staff só toca nos campos de fluxo. Total, itens, cliente e timestamp
+      // são IMUTÁVEIS após a criação — fecha adulteração financeira pós-venda
+      // (antes, um cashier podia reescrever qualquer campo via API direta,
+      // sem passar pelo audit log, que é gravado voluntariamente pelo painel).
       allow update: if isCashier(tenant)
-        // Nunca reescrever itens/valor/cliente/dono do pedido.
         && request.resource.data.diff(resource.data).affectedKeys()
              .hasOnly(['status','cancelReason','canceledBy','canceledAt'])
-        // Pedido cancelado é imutável — não existe "descancelar".
-        && resource.data.status != 'cancelado'
-        && (
-          // Update simples de status (sem cancelar): só valores conhecidos
-          (request.resource.data.status in ['novo','preparo','entrega','concluido'])
-          ||
-          // Cancelamento exige campos de auditoria
-          (request.resource.data.status == 'cancelado'
-            && request.resource.data.cancelReason is string
-            && request.resource.data.cancelReason.size() > 0
-            && request.resource.data.canceledBy is string)
-        );
+        && validOrderUpdate(resource.data, request.resource.data)
+        && (request.resource.data.status != 'cancelado'
+            || (request.resource.data.cancelReason is string
+                && request.resource.data.cancelReason.size() > 0
+                && request.resource.data.cancelReason.size() <= 280
+                && request.resource.data.canceledBy is string));
 
-      // Delete só owner (em geral, prefira manter histórico).
       allow delete: if isOwner(tenant);
     }
 
     // ---------- audit log (append-only, privado) ----------
     match /artifacts/{tenant}/private/audit/log/{entryId} {
       allow read: if isOwner(tenant);
-      // Qualquer admin autenticado do tenant pode escrever entrada,
-      // mas só insert — nunca edita ou apaga.
       allow create: if isCashier(tenant)
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.ts is number;
@@ -132,7 +176,6 @@ service cloud.firestore {
     }
 
     // ---------- catch-all ----------
-    // Nega qualquer documento não mapeado explicitamente.
     match /{document=**} {
       allow read, write: if false;
     }

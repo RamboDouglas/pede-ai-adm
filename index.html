@@ -16,13 +16,13 @@
     -->
     <meta http-equiv="Content-Security-Policy" content="
         default-src 'self';
-        script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://www.gstatic.com;
+        script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://www.gstatic.com https://www.google.com;
         style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net;
         font-src 'self' data: https://cdnjs.cloudflare.com;
         img-src 'self' data: https: blob:;
         media-src 'self' https://cdn.freesound.org;
-        connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://firestore.googleapis.com wss://*.firebaseio.com wss://localhost:* ws://localhost:* https://localhost:* http://localhost:*;
-        frame-src 'none';
+        connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://*.firebasedatabase.app https://firestore.googleapis.com https://www.google.com wss://*.firebaseio.com wss://localhost:* ws://localhost:* https://localhost:* http://localhost:*;
+        frame-src https://www.google.com;
         object-src 'none';
         base-uri 'self';
         form-action 'self';
@@ -30,10 +30,11 @@
     <link rel="icon" id="faviconEl" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23FFD700'/%3E%3Ctext x='50%25' y='55%25' text-anchor='middle' font-size='40' font-weight='900' fill='%230a0a0a' font-family='Arial'%3EB%3C/text%3E%3C/svg%3E">
     <title>Painel Brava | Admin</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet" integrity="sha384-3B6NwesSXE7YJlcLI9RpRqGf2p/EgVH8BgoKTaUrmKNDkHPStTQ3EyoYjCGXaOTS" crossorigin="anonymous">
+    <!-- chart.js FIXADO na 4.4.4 + SRI: versão flutuante podia trocar sozinha (quebra silenciosa) e um CDN comprometido injetaria JS. -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js" integrity="sha384-G436+Z2nlA8+PNoeRvWdxKbvOf8E/y+lYxqht2iBwNHTQDV5CJr3+AGVj8fGZi5t" crossorigin="anonymous"></script>
     <!-- QZ Tray: ponte com a impressora térmica via ESC/POS (sem driver do navegador) -->
-    <script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qz-tray@2.2.4/qz-tray.js" integrity="sha384-eMCJjoa43DLpNZRyAjocYkZuahMjTlfLpm5i5MD/QGBM8dBbMG0xtjp50LA4vyhe" crossorigin="anonymous"></script>
     <script>
         tailwind.config = {
             theme: { extend: { colors: { brava: { yellow: '#FFD700', black: '#111111' } } } }
@@ -391,7 +392,7 @@
                 </div>
                 <div class="bg-blue-50 border border-blue-200 rounded-xl p-4 flex items-start gap-3 text-xs text-blue-800">
                     <i class="fas fa-users mt-0.5 shrink-0"></i>
-                    <span><strong>Controle de acesso:</strong> múltiplos admins podem ser cadastrados no <a href="https://console.firebase.google.com/" target="_blank" class="underline font-bold">Firebase Authentication Console</a>. Todos os usuários autenticados têm acesso total — para permissões diferenciadas (gerente vs. dono), configure <strong>Custom Claims</strong> via Firebase Admin SDK.</span>
+                    <span><strong>Controle de acesso:</strong> o acesso é por <strong>papel</strong> (owner &gt; manager &gt; cashier) definido em <strong>Custom Claims</strong> do Firebase Auth. Sem claim, o usuário <strong>não entra</strong> — não há acesso total automático. O dono concede/revoga acesso pela função <code>setUserClaims</code> (ou <code>scripts/setup-claims.js</code>); as permissões de cada papel são aplicadas nas Firestore Rules.</span>
                 </div>
 
                 <div class="bg-white p-6 rounded-lg shadow space-y-3">
@@ -601,6 +602,23 @@
         // (APIs & Services > Credentials) e habilitar Firebase App Check.
         const firebaseConfig = { apiKey: "AIzaSyDcLJgd7hRug4DOdZG5pBVADvb8gv50X04", authDomain: "pede-ai-ff294.firebaseapp.com", projectId: "pede-ai-ff294", storageBucket: "pede-ai-ff294.firebasestorage.app", messagingSenderId: "785420254615", appId: "1:785420254615:web:14723281bba318ac9a98d2" };
         const app = initializeApp(firebaseConfig);
+
+        // App Check (reCAPTCHA v3): atesta que o request vem deste painel, não
+        // de um bot/script. Chave de SITE pública por design. Import DINÂMICO no
+        // try: nem a falha do download nem o reCAPTCHA (adblock) derrubam o
+        // painel — ele segue sem token. Em localhost, liga o modo debug (token
+        // no console → registrar no Firebase). Espelha o SDK já presente no
+        // storefront; ter o SDK NOS DOIS apps é pré-requisito para ligar o
+        // enforce do App Check no Firestore (ver README do storefront).
+        try {
+            if (['localhost', '127.0.0.1'].includes(location.hostname)) self.FIREBASE_APPCHECK_DEBUG_TOKEN = true;
+            const { initializeAppCheck, ReCaptchaV3Provider } = await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-app-check.js");
+            initializeAppCheck(app, {
+                provider: new ReCaptchaV3Provider('6LeC5EMtAAAAAMrSftZtlhneEAHfbdOb09kJXt3l'),
+                isTokenAutoRefreshEnabled: true
+            });
+        } catch (e) { console.warn('App Check não inicializou:', e); }
+
         const db = getFirestore(app);
         const auth = getAuth(app);
 
@@ -1593,8 +1611,8 @@
             }
             const s = window.settings || {};
             const shop = {
-                name:    s.shopName    || 'BRAVA CONVENIENCIA',
-                address: s.shopAddress || 'AVENIDA ATLANTICA 3480',
+                name:    s.shopName    || 'LOJA',
+                address: s.shopAddress || '',
                 phone:   s.shopPhone   || '',
                 cnpj:    s.shopCnpj    || '',
                 footer:  s.shopFooter  || 'Obrigado pela preferencia!'
@@ -1770,8 +1788,8 @@
                 return;
             }
             const shop = {
-                name:    (window.settings || {}).shopName    || 'BRAVA CONVENIENCIA',
-                address: (window.settings || {}).shopAddress || 'AVENIDA ATLÂNTICA 3480',
+                name:    (window.settings || {}).shopName    || 'LOJA',
+                address: (window.settings || {}).shopAddress || '',
                 footer:  (window.settings || {}).shopFooter  || 'Obrigado pela preferência!'
             };
             // B04: se fee > total (dado importado errado), subtotal negativo confunde o entregador.
@@ -2033,7 +2051,7 @@
             // Dados da empresa
             document.getElementById('shopName').value     = window.settings.shopName     || '';
             document.getElementById('shopAddress').value  = window.settings.shopAddress  || '';
-            document.getElementById('shopCity').value     = window.settings.shopCity     || 'Balneário Camboriú';
+            document.getElementById('shopCity').value     = window.settings.shopCity     || '';
             document.getElementById('shopPhone').value    = window.settings.shopPhone    || '';
             document.getElementById('shopWhatsapp').value = window.settings.shopWhatsapp || '';
             document.getElementById('shopCnpj').value     = window.settings.shopCnpj     || '';
