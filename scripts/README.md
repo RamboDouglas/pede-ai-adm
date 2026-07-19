@@ -1,8 +1,11 @@
 # Scripts de operação
 
-## setup-claims.js
-Aplica `tenantId` e `role` (Custom Claims) nos usuários do Firebase Auth.
-**Rode antes de publicar as novas `firestore.rules`** — sem o claim, ninguém entra.
+## setup-claims.js — bootstrap de loja nova
+
+Aplica `tenantId` e `role` (Custom Claims) via Admin SDK. Hoje serve para o
+**bootstrap do primeiro owner de um tenant novo** — o dia a dia da equipe
+(adicionar caixa/gerente, trocar papel, revogar) é feito pelo próprio dono no
+painel (**Configurações → Equipe**), que chama o backend em `functions/`.
 
 ```bash
 npm i firebase-admin
@@ -22,11 +25,23 @@ firebase login
 firebase deploy --only firestore:rules
 ```
 
+## Deploy do backend (Cloud Functions)
+
+Exige o projeto no plano **Blaze** (o free tier das functions cobre folgado
+uma loja).
+
+```bash
+cd functions && npm install && cd ..
+firebase deploy --only functions
+```
+
 ## Ordem de deploy seguro
 
 1. Setar claims em todos os usuários atuais (`setup-claims.js`).
-2. Confirmar que o painel novo (`index`) está em algum host de staging.
-3. Publicar as `firestore.rules`.
-4. Substituir o painel em produção.
+2. Publicar o backend (`firebase deploy --only functions`) — a seção Equipe
+   do painel depende dele.
+3. Confirmar que o painel novo (`index`) está em algum host de staging.
+4. Publicar as `firestore.rules`.
+5. Substituir o painel em produção.
 
-Inverter a ordem trava o painel até alguém logar com claim correto.
+Inverter claims ↔ rules trava o painel até alguém logar com claim correto.

@@ -16,6 +16,7 @@
 //  scripts/setup-claims.js — decisão de quem opera o SaaS, não do lojista.
 // =================================================================
 
+const crypto = require('node:crypto');
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
 const { setGlobalOptions } = require('firebase-functions/v2');
 const { initializeApp } = require('firebase-admin/app');
@@ -82,7 +83,15 @@ exports.setStaffClaims = onCall(async (request) => {
         if (e.code !== 'auth/user-not-found') {
             throw new HttpsError('internal', 'Falha ao buscar usuário: ' + e.message);
         }
-        user = await auth.createUser({ email: v.email, emailVerified: false, disabled: false });
+        // Senha aleatória descartável (ninguém conhece): garante que o provider
+        // email/senha exista, então o "Esqueci a senha" do login SEMPRE funciona
+        // como fluxo de convite — conta sem provider nenhum é caso ambíguo no Auth.
+        user = await auth.createUser({
+            email: v.email,
+            emailVerified: false,
+            disabled: false,
+            password: crypto.randomBytes(24).toString('base64url'),
+        });
         created = true;
     }
 

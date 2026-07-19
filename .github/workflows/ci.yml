@@ -16,3 +16,13 @@ jobs:
       # Testes unitários: funções puras extraídas do index.html + validações
       # do backend (functions/helpers.js). node:test nativo, zero dependências.
       - run: node --test tests/*.test.mjs functions/*.test.mjs
+      # Smoke do backend real: instala as deps e confirma que index.js carrega
+      # e exporta os 3 callables (pega import quebrado/typo antes do deploy).
+      - run: npm ci --prefix functions
+      - run: |
+          GCLOUD_PROJECT=ci-smoke node -e "
+            const exp = require('./functions/index.js');
+            const want = ['setStaffClaims','listStaff','removeStaffAccess'];
+            for (const n of want) if (typeof exp[n] !== 'function') { throw new Error('export ausente: ' + n); }
+            console.log('functions smoke OK');
+          "
