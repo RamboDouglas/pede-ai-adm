@@ -1908,7 +1908,12 @@
             const w = Math.round(w0 * scale), h = Math.round(h0 * scale);
             const canvas = document.createElement('canvas');
             canvas.width = w; canvas.height = h;
-            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+            const ctx = canvas.getContext('2d');
+            // Fundo branco: JPEG não tem transparência — sem isso, PNG com fundo
+            // transparente sairia com fundo PRETO na conversão.
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, w, h);
+            ctx.drawImage(img, 0, 0, w, h);
             return new Promise((res, rej) =>
                 canvas.toBlob(b => b ? res(b) : rej(new Error('Falha ao processar imagem.')), 'image/jpeg', 0.85));
         }
