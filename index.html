@@ -558,8 +558,23 @@
             </div>
             
             <div>
-                <label class="text-xs font-bold text-gray-500">Emoji ou URL da Imagem</label>
-                <input type="text" id="editImg" class="w-full border-2 border-gray-100 p-2 rounded-lg focus:border-brava-yellow outline-none" placeholder="🍺 ou https://...">
+                <label class="text-xs font-bold text-gray-500">Foto do Produto</label>
+                <div class="flex items-center gap-3 mt-1">
+                    <div id="imgPreview" class="w-16 h-16 rounded-lg border-2 border-gray-100 bg-gray-50 flex items-center justify-center text-3xl overflow-hidden shrink-0">📦</div>
+                    <div class="flex-1 space-y-1.5">
+                        <button type="button" onclick="document.getElementById('editImgFile').click()" class="w-full bg-gray-800 text-white py-2 rounded-lg font-bold text-xs hover:bg-gray-700 transition">
+                            <i class="fas fa-camera mr-1"></i> Enviar Foto do Aparelho
+                        </button>
+                        <button type="button" onclick="clearProductImage()" class="w-full border border-gray-200 text-gray-400 py-1 rounded-lg font-bold text-[10px] hover:text-red-500 hover:border-red-300 transition">Remover imagem</button>
+                    </div>
+                </div>
+                <input type="file" id="editImgFile" accept="image/*" class="hidden" onchange="handleProductImageFile(this.files[0]); this.value=''">
+                <p id="imgUploadStatus" class="text-[10px] font-bold text-green-600 mt-1 hidden"></p>
+            </div>
+
+            <div>
+                <label class="text-xs font-bold text-gray-500">Ou Emoji / URL da Imagem</label>
+                <input type="text" id="editImg" oninput="onImgFieldTyped()" class="w-full border-2 border-gray-100 p-2 rounded-lg focus:border-brava-yellow outline-none" placeholder="🍺 ou https://...">
             </div>
             
             <div>
@@ -1826,6 +1841,132 @@
             .map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)}</option>`)
             .join('');
 
+        // ====================================================================
+        //  FOTO DO PRODUTO — upload para o Firebase Storage do projeto
+        // --------------------------------------------------------------------
+        //  Antes só existia o campo de URL externa: quando o link morria, o
+        //  produto ficava sem foto no site. Agora o dono envia a foto do
+        //  próprio aparelho; ela é comprimida no navegador, sobe para o
+        //  Storage (tenants/{tenant}/products/) e a URL permanente gerada é
+        //  gravada no mesmo campo `img` — o storefront continua lendo uma
+        //  URL https normal, sem precisar de mudança lá.
+        // ====================================================================
+
+        let _pendingImgBlob = null;   // foto comprimida aguardando o SALVAR
+
+        const isOwnStorageUrl = (u) => {
+            const s = String(u || '');
+            const path = `tenants/${appId}/products/`;
+            return s.includes('firebasestorage') && (s.includes(path) || s.includes(encodeURIComponent(path)));
+        };
+
+        function setImgPreview(value) {
+            const box = document.getElementById('imgPreview');
+            if (!box) return;
+            if (value instanceof Blob) {
+                const url = URL.createObjectURL(value);
+                box.innerHTML = `<img src="${url}" class="w-full h-full object-cover" onload="URL.revokeObjectURL(this.src)">`;
+            } else if (isHttpUrl(value)) {
+                box.innerHTML = `<img src="${escapeHtml(value)}" class="w-full h-full object-cover" onerror="this.parentElement.textContent='📦'">`;
+            } else {
+                box.textContent = String(value || '📦').trim() || '📦';
+            }
+        }
+
+        function hideImgUploadStatus() {
+            const st = document.getElementById('imgUploadStatus');
+            if (st) st.classList.add('hidden');
+        }
+
+        function resetProductImageState(imgValue) {
+            _pendingImgBlob = null;
+            hideImgUploadStatus();
+            setImgPreview(imgValue || '');
+        }
+
+        // Comprime no navegador: máx 800px no maior lado, JPEG 85%. Foto de
+        // celular de 4MB vira ~80KB — upload rápido e Storage barato.
+        async function compressImage(file) {
+            const loadBitmap = async () => {
+                if (typeof createImageBitmap === 'function') {
+                    try { return await createImageBitmap(file); } catch (_) {}
+                }
+                // Fallback (navegador antigo ou formato que o bitmap não decodifica)
+                return new Promise((res, rej) => {
+                    const url = URL.createObjectURL(file);
+                    const im = new Image();
+                    im.onload = () => { URL.revokeObjectURL(url); res(im); };
+                    im.onerror = () => { URL.revokeObjectURL(url); rej(new Error('decode')); };
+                    im.src = url;
+                });
+            };
+            const img = await loadBitmap();
+            const w0 = img.width || img.naturalWidth, h0 = img.height || img.naturalHeight;
+            if (!w0 || !h0) throw new Error('Imagem sem dimensões.');
+            const MAX = 800;
+            const scale = Math.min(1, MAX / Math.max(w0, h0));
+            const w = Math.round(w0 * scale), h = Math.round(h0 * scale);
+            const canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+            return new Promise((res, rej) =>
+                canvas.toBlob(b => b ? res(b) : rej(new Error('Falha ao processar imagem.')), 'image/jpeg', 0.85));
+        }
+
+        window.handleProductImageFile = async (file) => {
+            if (!file) return;
+            if (!file.type.startsWith('image/')) return showToast('O arquivo escolhido não é uma imagem.');
+            if (file.size > 10 * 1024 * 1024)    return showToast('Imagem muito grande (máx 10MB).');
+            try {
+                _pendingImgBlob = await compressImage(file);
+                setImgPreview(_pendingImgBlob);
+                document.getElementById('editImg').value = '';   // a foto enviada tem prioridade
+                const st = document.getElementById('imgUploadStatus');
+                if (st) {
+                    st.textContent = `Foto pronta (${Math.max(1, Math.round(_pendingImgBlob.size / 1024))}KB) — será enviada ao clicar em SALVAR.`;
+                    st.classList.remove('hidden');
+                }
+            } catch (e) {
+                showToast('Não foi possível ler esta imagem. Tente outra (JPG/PNG).');
+            }
+        };
+
+        // Digitar emoji/URL cancela a foto pendente — a última ação do usuário vence.
+        window.onImgFieldTyped = () => {
+            _pendingImgBlob = null;
+            hideImgUploadStatus();
+            setImgPreview(document.getElementById('editImg').value.trim());
+        };
+
+        window.clearProductImage = () => {
+            document.getElementById('editImg').value = '';
+            resetProductImageState('');
+        };
+
+        // Sobe o blob e devolve a URL permanente. Import dinâmico (como o App
+        // Check): o SDK do Storage só é baixado quando alguém realmente envia foto.
+        async function uploadProductImage(blob) {
+            const { getStorage, ref, uploadBytes, getDownloadURL } =
+                await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-storage.js");
+            const storage = getStorage(app);
+            const name = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+            const fileRef = ref(storage, `tenants/${appId}/products/${name}`);
+            await uploadBytes(fileRef, blob, { contentType: 'image/jpeg' });
+            return await getDownloadURL(fileRef);
+        }
+
+        // Apaga a foto antiga ao trocar/excluir — best effort: falha silenciosa
+        // não trava o fluxo (arquivo órfão só ocupa espaço). Só toca em URLs do
+        // Storage DESTE tenant; URL externa/emoji é ignorada.
+        async function deleteStorageImage(url) {
+            try {
+                if (!isOwnStorageUrl(url)) return;
+                const { getStorage, ref, deleteObject } =
+                    await import("https://www.gstatic.com/firebasejs/11.6.1/firebase-storage.js");
+                await deleteObject(ref(getStorage(app), url));
+            } catch (_) {}
+        }
+
         window.editProduct = (id) => {
             const p = window.products.find(x => x.id === id);
             if (!p) return;
@@ -1837,6 +1978,7 @@
             document.getElementById('editActive').checked = p.active !== false;
             document.getElementById('editCat').innerHTML = renderCatOptions();
             document.getElementById('editCat').value = p.cat;
+            resetProductImageState(p.img);
             document.getElementById('btnDel').classList.remove('hidden');
             document.getElementById('prodModal').classList.remove('hidden');
         };
@@ -1854,10 +1996,27 @@
             if (!Number.isFinite(price) || price < 0 || price > 99999) return showToast('Preço inválido.');
             if (!cat)                                                  return showToast('Selecione uma categoria.');
             if (!window.categories.some(c => c.id === cat))            return showToast('Categoria inexistente.');
+
+            // Foto pendente sobe ANTES de gravar o produto — se o upload falhar,
+            // nada é salvo (evita produto gravado sem a foto que o dono escolheu).
+            // Limite de 500 chars: a URL de download do Storage passa de 200.
+            let img = safeImgUrl(document.getElementById('editImg').value).slice(0, 500);
+            const saveBtn = document.querySelector('[onclick="saveProduct()"]');
+            const saveBtnHtml = saveBtn ? saveBtn.innerHTML : '';
+            if (saveBtn) { saveBtn.disabled = true; saveBtn.innerHTML = _pendingImgBlob ? '<i class="fas fa-spinner fa-spin mr-1"></i> ENVIANDO FOTO...' : '<i class="fas fa-spinner fa-spin mr-1"></i> SALVANDO...'; }
+            const restoreBtn = () => { if (saveBtn) { saveBtn.disabled = false; saveBtn.innerHTML = saveBtnHtml; } };
+            if (_pendingImgBlob) {
+                try {
+                    img = await uploadProductImage(_pendingImgBlob);
+                } catch (e) {
+                    restoreBtn();
+                    return showToast('Falha ao enviar a foto: ' + e.message + ' — verifique se o Firebase Storage está ativado (ver README).');
+                }
+            }
             const data = {
                 name,
                 price,
-                img:    safeImgUrl(document.getElementById('editImg').value).slice(0, 200),
+                img,
                 desc:   document.getElementById('editDesc').value.trim().slice(0, 200),
                 cat,
                 active: document.getElementById('editActive').checked
@@ -1867,6 +2026,8 @@
                 if (id) {
                     const before = window.products.find(p => p.id === id) || null;
                     await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id), data, { merge: true });
+                    // Troca de foto: a antiga hospedada no Storage vira lixo — apaga em background.
+                    if (before?.img && before.img !== data.img) deleteStorageImage(before.img);
                     document.getElementById('prodModal').classList.add('hidden');
                     logAudit('product.update', id, before, data);
                 } else {
@@ -1881,8 +2042,11 @@
                     document.getElementById('editName').focus();
                     logAudit('product.create', ref.id, null, data);
                 }
+                resetProductImageState('');
             } catch(e) {
                 showToast("Erro ao salvar: " + e.message);
+            } finally {
+                restoreBtn();
             }
         };
 
@@ -1893,6 +2057,8 @@
             const before = window.products.find(p => p.id === id) || null;
             try {
                 await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id));
+                // Foto hospedada no Storage acompanha o produto — apaga em background.
+                if (before?.img) deleteStorageImage(before.img);
                 document.getElementById('prodModal').classList.add('hidden');
                 logAudit('product.delete', id, before, null);
             } catch (e) {
@@ -1906,6 +2072,8 @@
             document.getElementById('editImg').value = '';
             document.getElementById('editDesc').value = '';
             document.getElementById('editCat').innerHTML = renderCatOptions();
+            resetProductImageState('');
+            document.getElementById('btnDel').classList.add('hidden');
             document.getElementById('prodModal').classList.remove('hidden');
             document.getElementById('editName').focus();
         };
@@ -1940,7 +2108,7 @@
                     name: name.slice(0,120),
                     price: parsedPrice,
                     cat: finalCat.slice(0,40),
-                    img: (img || '📦').slice(0,200),
+                    img: (img || '📦').slice(0,500),
                     desc: (desc || '').slice(0,200),
                     active: true
                 });

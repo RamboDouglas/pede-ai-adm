@@ -1,0 +1,39 @@
+rules_version = '2';
+
+// =================================================================
+//  Firebase Storage Rules — Pede AI (fotos de produto)
+//
+//  Único caminho gravável: tenants/{tenant}/products/ — onde o painel
+//  admin sobe as fotos enviadas do aparelho do dono/gerente.
+//  Leitura pública: o storefront (cardápio do cliente) exibe as fotos
+//  sem login, igual à leitura anônima dos docs de produto no Firestore.
+//
+//  Deploy: firebase deploy --only storage
+// =================================================================
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Fotos de produto do tenant.
+    // Escrita: só owner/manager DO MESMO tenant (Custom Claims — os mesmos
+    // usados nas firestore.rules), imagem de até 2MB. O painel comprime
+    // para ~800px/JPEG antes de subir, então 2MB é folga, não meta.
+    match /tenants/{tenant}/products/{file} {
+      allow read: if true;
+      allow create, update: if request.auth != null
+        && request.auth.token.tenantId == tenant
+        && request.auth.token.role in ['owner', 'manager']
+        && request.resource.size <= 2 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      // Delete separado: em delete não existe request.resource (size/type).
+      allow delete: if request.auth != null
+        && request.auth.token.tenantId == tenant
+        && request.auth.token.role in ['owner', 'manager'];
+    }
+
+    // Catch-all: nada além das fotos de produto.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
